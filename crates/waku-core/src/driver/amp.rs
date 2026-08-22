@@ -30,6 +30,7 @@ use anyhow::{Context as _, anyhow};
 use crossbeam_channel::{Sender, unbounded};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use waku_protocol::TurnPrompt;
 
 use super::activity;
 use crate::driver::{
@@ -348,8 +349,8 @@ impl AmpDriver {
 }
 
 impl DriverControl for AmpDriver {
-    fn prompt(&self, prompt: String) {
-        let _ = self.commands.send(CommandMessage::Prompt(prompt));
+    fn prompt(&self, turn: TurnPrompt) {
+        let _ = self.commands.send(CommandMessage::Prompt(turn.prompt));
     }
 
     fn supports_steer(&self) -> bool {
@@ -582,7 +583,7 @@ mod tests {
         .expect("the streaming session should start");
 
         let collect = |driver: &AmpDriver, prompt: &str| -> String {
-            driver.prompt(prompt.to_owned());
+            driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), prompt));
             let mut text = String::new();
             while let Ok(event) = event_rx.recv_timeout(std::time::Duration::from_secs(180)) {
                 match event {
@@ -640,11 +641,11 @@ mod tests {
         )
         .expect("the streaming session should start");
 
-        driver.prompt(
+        driver.prompt(TurnPrompt::new(
+            uuid::Uuid::new_v4(),
             "Use the Bash tool to run exactly `sleep 6` (nothing else). \
-             After the command completes, reply with exactly: FIRST DONE"
-                .into(),
-        );
+             After the command completes, reply with exactly: FIRST DONE",
+        ));
 
         let mut text = String::new();
         let mut steered = false;

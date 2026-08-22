@@ -30,6 +30,13 @@ import type {
 export type TaskState = Extract<ResponsePayload, { type: 'taskState' }>
 export type DaemonDirectory = Extract<WorkspaceResult, { type: 'directory' }>
 
+export interface AcceptedTurnSubmission {
+  turnId: string
+  displayContent: string
+  providerPrompt: string
+  attachments: MessageAttachment[]
+}
+
 export const daemonKeys = {
   taskState: (address: string) => ['daemon', address, 'task-state'] as const,
   composerDrafts: (address: string) => ['daemon', address, 'composer-drafts'] as const,
@@ -628,11 +635,11 @@ export function createSession(
 
 export function beginTurn(
   session: AgentSession,
+  turnId: string,
   prompt: string,
   attachments: MessageAttachment[] = [],
 ): AgentSession {
   const now = unixTime()
-  const turnId = crypto.randomUUID()
   const visiblePrompt = prompt.trim()
   const mentions = attachments.map((attachment) => `@${attachment.mention}`).join(' ')
   const providerPrompt = [visiblePrompt, mentions].filter(Boolean).join(' ')
@@ -670,6 +677,51 @@ export function beginTurn(
         started_at: now,
         completed_at: null,
         checkpoint: null,
+      },
+    ],
+  }
+}
+
+export function acceptTurnSubmission(
+  rawPrompt: string,
+  attachments: MessageAttachment[] = [],
+  providerPromptOverride?: string,
+  acceptedTurnId?: string,
+): AcceptedTurnSubmission | null {
+  const displayContent = rawPrompt.trim()
+  if (!displayContent && attachments.length === 0) return null
+  const providerPrompt = providerPromptOverride === undefined
+    ? [
+        displayContent,
+        attachments.map((attachment) => `@${attachment.mention}`).join(' '),
+      ].filter(Boolean).join(' ')
+    : providerPromptOverride.trim()
+  return {
+    turnId: acceptedTurnId ?? crypto.randomUUID(),
+    displayContent,
+    providerPrompt,
+    attachments,
+  }
+}
+
+export function queueSubmission(
+  session: AgentSession,
+  submission: AcceptedTurnSubmission,
+): AgentSession {
+  return {
+    ...session,
+    updated_at: unixTime(),
+    queued_messages: [
+      ...(session.queued_messages ?? []),
+      {
+        id: submission.turnId,
+        content: submission.providerPrompt,
+        display_content:
+          submission.attachments.length || submission.providerPrompt !== submission.displayContent
+          ? submission.displayContent
+          : null,
+        attachments: submission.attachments,
+        created_at: unixTime(),
       },
     ],
   }

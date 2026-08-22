@@ -984,6 +984,7 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use waku_client::DaemonClient;
+    use waku_protocol::TurnPrompt;
 
     #[derive(Default)]
     struct TestBackend {
@@ -1006,8 +1007,8 @@ mod tests {
                     runtime_id: self.runtimes.lock().get(&session_id).copied(),
                     supports_steer: true,
                 }),
-                Command::Prompt { prompt } => {
-                    events.send(WireDriverEvent::new("textDelta", json!(prompt)))?;
+                Command::Prompt { turn } => {
+                    events.send(WireDriverEvent::new("textDelta", json!(turn.prompt)))?;
                     Ok(ResponsePayload::Ack)
                 }
                 Command::CloseSession => {
@@ -1397,7 +1398,7 @@ mod tests {
                 session_id,
                 runtime_id,
                 Command::Prompt {
-                    prompt: "streamed from the first client".into(),
+                    turn: TurnPrompt::new(Uuid::new_v4(), "streamed from the first client"),
                 },
             )
             .unwrap();
@@ -1815,7 +1816,7 @@ mod tests {
                 session_id: blocked_session_id,
                 runtime_id: blocked_runtime_id,
                 command: Command::Prompt {
-                    prompt: "after start".into(),
+                    turn: TurnPrompt::new(Uuid::new_v4(), "after start"),
                 },
             },
             second_client_outgoing,

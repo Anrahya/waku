@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) fn prepared_submission_can_start(session: &AgentSession, turn_id: Uuid) -> bool {
+    session.status == SessionStatus::Connecting
+        && session.turns.last().is_some_and(|turn| {
+            turn.id == turn_id && turn.status == TurnStatus::Running && !turn.provider_turn_started
+        })
+}
+
+pub(super) fn unwind_failed_submission(session: &mut AgentSession, turn_id: Uuid) -> bool {
+    if !prepared_submission_can_start(session, turn_id) {
+        return false;
+    }
+    session.unwind_unstarted_turn(turn_id);
+    session.status = SessionStatus::Idle;
+    true
+}
+
 fn workspace_ack(
     workspace: &waku_client::WorkspaceClient,
     operation: waku_client::WorkspaceOperation,
@@ -2135,6 +2151,7 @@ impl Waku {
         self.start_message_rewind(
             edit.clone(),
             ComposerSubmission {
+                id: Uuid::new_v4(),
                 prompt: provider_prompt,
                 display_content,
                 attachments: edit.attachments,
@@ -3034,7 +3051,8 @@ impl Waku {
         };
         let transcript_anchor = if let Some(session) = self.state.session_mut(session_id) {
             session.set_title_from_prompt(&human_prompt);
-            let turn_id = session.begin_turn_with_presentation(
+            let turn_id = session.begin_turn_with_id_and_presentation(
+                submission.id,
                 &prompt,
                 submission.display_content.clone(),
                 submission.attachments.clone(),
@@ -3125,6 +3143,16 @@ impl Waku {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.submission_preparations.remove(&session_id);
+                let can_unwind = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .is_some_and(|session| prepared_submission_can_start(session, submission.id));
+                if !can_unwind {
+                    cx.notify();
+                    return;
+                }
                 self.track_active_turn_outcome(
                     session_id,
                     crate::analytics::TurnOutcome::PreparationFailed,
@@ -3137,16 +3165,12 @@ impl Waku {
                 } else {
                     Vec::new()
                 };
-                if let Some(session) = self.state.session_mut(session_id)
-                    && session.status == SessionStatus::Connecting
-                {
+                if let Some(session) = self.state.session_mut(session_id) {
                     // The submission never reached a provider and its prompt
                     // returns to the composer, so the eagerly-begun turn and
                     // its message leave the transcript with it.
-                    if let Some(turn_id) = session.active_turn_id() {
-                        session.unwind_unstarted_turn(turn_id);
-                    }
-                    session.status = SessionStatus::Idle;
+                    let unwound = unwind_failed_submission(session, submission.id);
+                    debug_assert!(unwound, "validated submission must still unwind");
                 }
                 if selected {
                     if self
@@ -3179,12 +3203,7 @@ impl Waku {
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .is_some_and(|session| {
-                session.status == SessionStatus::Connecting
-                    && session.turns.last().is_some_and(|turn| {
-                        turn.status == TurnStatus::Running && !turn.provider_turn_started
-                    })
-            });
+            .is_some_and(|session| prepared_submission_can_start(session, submission.id));
         if !can_start {
             self.submission_preparations.remove(&session_id);
             cx.notify();
@@ -3240,11 +3259,11 @@ impl Waku {
         // and the transport. The user message keeps the typed slash form,
         // while templates expand and skills adopt provider-native syntax.
         // Claude's commands pass through untouched; its CLI owns expansion.
-        let prompt = submission.prompt;
+        let prompt = submission.prompt.clone();
         let driver_prompt = self.resolve_provider_submission(provider, &prompt);
         let mut failed_to_start = false;
         match driver {
-            Ok(driver) => driver.prompt(driver_prompt),
+            Ok(driver) => driver.prompt(submission.turn_prompt(driver_prompt)),
             Err(error) => {
                 failed_to_start = true;
                 let message = tr!("errors.start_agent", error = error);

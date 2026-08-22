@@ -24,6 +24,7 @@ use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
 use crate::model::{ActivityKind, DriverEvent, InteractionMode, ProviderResumeCursor, RuntimeMode};
+use waku_protocol::TurnPrompt;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -708,8 +709,8 @@ impl PiDriver {
 }
 
 impl DriverControl for PiDriver {
-    fn prompt(&self, prompt: String) {
-        let _ = self.commands.send(CommandMessage::Prompt(prompt));
+    fn prompt(&self, turn: TurnPrompt) {
+        let _ = self.commands.send(CommandMessage::Prompt(turn.prompt));
     }
 
     fn supports_steer(&self) -> bool {
@@ -1525,7 +1526,10 @@ mod tests {
         }
         assert!(connected, "Pi never reported its native session");
 
-        driver.prompt("Reply with exactly: OK. Do not use any tools.".into());
+        driver.prompt(TurnPrompt::new(
+            uuid::Uuid::new_v4(),
+            "Reply with exactly: OK. Do not use any tools.",
+        ));
         let mut finished = false;
         while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(180)) {
             match event {
@@ -1782,7 +1786,10 @@ mod tests {
             "Oh My Pi should report its own cursor with a session file, got {cursor:?}"
         );
 
-        driver.prompt("Reply with exactly: OK. Do not use any tools.".into());
+        driver.prompt(TurnPrompt::new(
+            uuid::Uuid::new_v4(),
+            "Reply with exactly: OK. Do not use any tools.",
+        ));
         let mut finished = false;
         let mut context_tokens = None;
         let mut context_window = None;

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
+use waku_protocol::TurnPrompt;
 
 use crate::computer_use::ComputerToolRequest;
 use crate::model::{
@@ -81,8 +82,8 @@ impl DriverHandle {
         Self { inner: control }
     }
 
-    pub fn prompt(&self, prompt: String) {
-        self.inner.prompt(prompt);
+    pub fn prompt(&self, turn: TurnPrompt) {
+        self.inner.prompt(turn);
     }
 
     /// Whether this transport can inject a user message into the currently
@@ -141,7 +142,7 @@ impl DriverHandle {
 }
 
 pub trait DriverControl: Send + Sync {
-    fn prompt(&self, prompt: String);
+    fn prompt(&self, turn: TurnPrompt);
     fn supports_steer(&self) -> bool {
         false
     }

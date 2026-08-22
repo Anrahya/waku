@@ -28,6 +28,7 @@ use agent_client_protocol::{
 use anyhow::{Context as _, anyhow};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
+use waku_protocol::TurnPrompt;
 
 use super::activity;
 use crate::driver::{
@@ -1830,8 +1831,8 @@ fn classify(kind: &str) -> ActivityKind {
 }
 
 impl DriverControl for AcpDriver {
-    fn prompt(&self, prompt: String) {
-        let _ = self.commands.try_send(CommandMessage::Prompt(prompt));
+    fn prompt(&self, turn: TurnPrompt) {
+        let _ = self.commands.try_send(CommandMessage::Prompt(turn.prompt));
     }
 
     fn supports_steer(&self) -> bool {
@@ -2440,7 +2441,7 @@ mod tests {
                 _ => {}
             }
         }
-        driver.prompt("hi".into());
+        driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), "hi"));
         let mut finished = None;
         while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(120)) {
             match event {
@@ -2494,7 +2495,7 @@ mod tests {
                 _ => {}
             }
         }
-        driver.prompt("Reply exactly OK.".into());
+        driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), "Reply exactly OK."));
 
         let mut produced_text = false;
         let mut finished = None;
@@ -2553,7 +2554,10 @@ mod tests {
                 _ => {}
             }
         }
-        driver.prompt("Say hi in three words.".into());
+        driver.prompt(TurnPrompt::new(
+            uuid::Uuid::new_v4(),
+            "Say hi in three words.",
+        ));
 
         let mut produced_content = false;
         let mut reported_error = None;

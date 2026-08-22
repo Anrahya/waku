@@ -326,6 +326,7 @@ enum RemoteImageState {
 /// mentions out of the user bubble.
 #[derive(Clone, Debug)]
 struct ComposerSubmission {
+    id: Uuid,
     prompt: String,
     display_content: Option<String>,
     attachments: Vec<MessageAttachment>,
@@ -334,6 +335,7 @@ struct ComposerSubmission {
 impl ComposerSubmission {
     fn plain(prompt: String) -> Self {
         Self {
+            id: Uuid::new_v4(),
             prompt,
             display_content: None,
             attachments: Vec::new(),
@@ -341,14 +343,27 @@ impl ComposerSubmission {
     }
 
     fn into_queued_message(self) -> QueuedMessage {
-        QueuedMessage::with_presentation(self.prompt, self.display_content, self.attachments)
+        QueuedMessage::with_id_and_presentation(
+            self.id,
+            self.prompt,
+            self.display_content,
+            self.attachments,
+        )
     }
 
     fn from_queued_message(message: QueuedMessage) -> Self {
         Self {
+            id: message.id,
             prompt: message.content,
             display_content: message.display_content,
             attachments: message.attachments,
+        }
+    }
+
+    fn turn_prompt(&self, prompt: String) -> waku_protocol::TurnPrompt {
+        waku_protocol::TurnPrompt {
+            id: self.id,
+            prompt,
         }
     }
 

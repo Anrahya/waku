@@ -73,6 +73,8 @@ use std::{
 };
 use uuid::Uuid;
 
+mod turn_identity;
+
 fn attach_changed_files(session: &mut AgentSession, files: Vec<CheckpointFile>) {
     let turn = session.turns.last_mut().expect("the test has a turn");
     turn.checkpoint = Some(Checkpoint {

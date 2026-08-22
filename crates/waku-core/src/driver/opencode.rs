@@ -23,6 +23,7 @@ use anyhow::{Context as _, anyhow};
 use crossbeam_channel::{Sender, unbounded};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use waku_protocol::TurnPrompt;
 
 use super::activity;
 use crate::driver::{
@@ -476,8 +477,8 @@ impl OpenCodeDriver {
 }
 
 impl DriverControl for OpenCodeDriver {
-    fn prompt(&self, prompt: String) {
-        let _ = self.commands.send(CommandMessage::Prompt(prompt));
+    fn prompt(&self, turn: TurnPrompt) {
+        let _ = self.commands.send(CommandMessage::Prompt(turn.prompt));
     }
 
     fn supports_steer(&self) -> bool {
@@ -1276,7 +1277,10 @@ mod tests {
             event => panic!("expected an OpenCode cursor, got {event:?}"),
         };
 
-        driver.prompt("Reply with exactly: OK. Do not use any tools.".into());
+        driver.prompt(TurnPrompt::new(
+            uuid::Uuid::new_v4(),
+            "Reply with exactly: OK. Do not use any tools.",
+        ));
         let mut text = String::new();
         let mut finished = None;
         let mut context_tokens = None;
@@ -1355,11 +1359,11 @@ mod tests {
         )
         .expect("the server should start and open a session");
 
-        driver.prompt(
+        driver.prompt(TurnPrompt::new(
+            uuid::Uuid::new_v4(),
             "Use the bash tool to run exactly `sleep 6` (nothing else). \
-             After the command completes, reply with exactly: FIRST DONE"
-                .into(),
-        );
+             After the command completes, reply with exactly: FIRST DONE",
+        ));
 
         let mut text = String::new();
         let mut steered = false;

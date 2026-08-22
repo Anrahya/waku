@@ -422,6 +422,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn notify_keeps_prompt_turn_identity_in_the_outgoing_request() {
+        let (outgoing, outgoing_rx) = unbounded();
+        let client = DaemonClient {
+            inner: Arc::new(ClientInner {
+                outgoing,
+                pending: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::new()),
+                pending_events: Mutex::new(HashMap::new()),
+                task_state_subscribers: Mutex::new(Vec::new()),
+                last_sequences: Mutex::new(HashMap::new()),
+                disconnected: AtomicBool::new(false),
+            }),
+        };
+        let id = Uuid::from_u128(7);
+
+        client
+            .notify(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Command::Prompt {
+                    turn: waku_protocol::TurnPrompt::new(id, "Build it"),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outgoing_rx.recv().unwrap(),
+            Outgoing::Message(ClientMessage::Request(Request {
+                command: Command::Prompt {
+                    turn: waku_protocol::TurnPrompt { id: observed, prompt }
+                },
+                ..
+            })) if observed == id && prompt == "Build it"
+        ));
+    }
+
+    #[test]
     fn daemon_endpoint_accepts_addresses_and_secure_urls() {
         assert_eq!(
             daemon_url("127.0.0.1:4312").unwrap(),

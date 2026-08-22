@@ -620,6 +620,7 @@ export function Composer({
               message.display_content ?? message.content,
               message.attachments ?? [],
               message.content,
+              message.id,
             ).catch((error) => toast.error(errorMessage(error)))
           }}
         />

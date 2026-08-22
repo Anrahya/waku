@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { ComposerDraftChange, DaemonSettings, Project, WakuClient } from '@waku/client'
 import {
+  acceptTurnSubmission,
   applyComposerDraftChanges,
   beginTurn,
   browseDaemonDirectory,
@@ -11,6 +12,7 @@ import {
   persistProject,
   persistSession,
   probeProvider,
+  queueSubmission,
   removeSession,
   selectableProjects,
   writeWorkspaceTextFile,
@@ -39,18 +41,56 @@ describe('applyComposerDraftChanges', () => {
 describe('beginTurn', () => {
   test('puts the submitted prompt in the transcript before runtime startup', () => {
     const draft = createSession('project', 'codex', false)
-    const active = beginTurn(draft, 'Build the feature')
+    const turnId = '00000000-0000-4000-8000-000000000007'
+    const active = beginTurn(draft, turnId, 'Build the feature')
 
     expect(active.status).toBe('connecting')
     expect(active.messages).toHaveLength(1)
     expect(active.messages[0]).toMatchObject({
+      turn_id: turnId,
       role: 'user',
       content: 'Build the feature',
       streaming: false,
     })
     expect(active.turns).toHaveLength(1)
+    expect(active.turns[0]?.id).toBe(turnId)
     expect(draft.messages).toHaveLength(0)
   })
+})
+
+describe('acceptTurnSubmission', () => {
+  test('admits one typed submission with the supplied turn identity', () => {
+    const turnId = '00000000-0000-4000-8000-000000000008'
+
+    expect(acceptTurnSubmission('  Build it  ', [], '  /skill:build  ', turnId)).toEqual({
+      turnId,
+      displayContent: 'Build it',
+      providerPrompt: '/skill:build',
+      attachments: [],
+    })
+    expect(acceptTurnSubmission('   ', [])).toBeNull()
+  })
+})
+
+describe('queueSubmission', () => {
+  test('keeps the accepted turn identity for later queue draining', () => {
+    const draft = createSession('project', 'codex', false)
+    const id = '00000000-0000-4000-8000-000000000009'
+
+    const queued = queueSubmission(draft, {
+      turnId: id,
+      displayContent: 'Follow up',
+      providerPrompt: 'Follow up',
+      attachments: [],
+    })
+
+    expect(queued.queued_messages).toHaveLength(1)
+    expect(queued.queued_messages?.[0]).toMatchObject({
+      id,
+      content: 'Follow up',
+    })
+  })
+
 })
 
 describe('browseDaemonDirectory', () => {

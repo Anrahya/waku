@@ -692,13 +692,7 @@ pub struct QueuedMessage {
 
 impl QueuedMessage {
     pub fn new(content: impl Into<String>) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            content: content.into(),
-            display_content: None,
-            attachments: Vec::new(),
-            created_at: unix_time(),
-        }
+        Self::with_id_and_presentation(Uuid::new_v4(), content, None, Vec::new())
     }
 
     pub fn with_presentation(
@@ -706,10 +700,21 @@ impl QueuedMessage {
         display_content: Option<String>,
         attachments: Vec<MessageAttachment>,
     ) -> Self {
+        Self::with_id_and_presentation(Uuid::new_v4(), content, display_content, attachments)
+    }
+
+    pub fn with_id_and_presentation(
+        id: Uuid,
+        content: impl Into<String>,
+        display_content: Option<String>,
+        attachments: Vec<MessageAttachment>,
+    ) -> Self {
         Self {
+            id,
+            content: content.into(),
             display_content,
             attachments,
-            ..Self::new(content)
+            created_at: unix_time(),
         }
     }
 
@@ -1184,6 +1189,16 @@ impl AgentSession {
         attachments: Vec<MessageAttachment>,
     ) -> Uuid {
         let id = Uuid::new_v4();
+        self.begin_turn_with_id_and_presentation(id, prompt, display_content, attachments)
+    }
+
+    pub fn begin_turn_with_id_and_presentation(
+        &mut self,
+        id: Uuid,
+        prompt: impl Into<String>,
+        display_content: Option<String>,
+        attachments: Vec<MessageAttachment>,
+    ) -> Uuid {
         let now = unix_time();
         self.turns.push(AgentTurn {
             id,
@@ -3910,6 +3925,33 @@ mod tests {
         session.unwind_unstarted_turn(started);
         assert_eq!(session.turns.len(), 2);
         assert_eq!(session.messages.len(), 3);
+    }
+
+    #[test]
+    fn supplied_turn_identity_owns_the_turn_and_user_message() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        let turn_id = Uuid::from_u128(42);
+
+        let returned =
+            session.begin_turn_with_id_and_presentation(turn_id, "Build it", None, Vec::new());
+
+        assert_eq!(returned, turn_id);
+        assert_eq!(session.turns[0].id, turn_id);
+        assert_eq!(session.messages[0].turn_id, Some(turn_id));
+    }
+
+    #[test]
+    fn queued_message_can_keep_its_accepted_turn_identity() {
+        let id = Uuid::from_u128(43);
+        let queued = QueuedMessage::with_id_and_presentation(
+            id,
+            "Follow up",
+            Some("Follow up".into()),
+            Vec::new(),
+        );
+
+        assert_eq!(queued.id, id);
     }
 
     #[test]

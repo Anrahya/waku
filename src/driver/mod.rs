@@ -152,8 +152,8 @@ impl RemoteDriverControl {
 }
 
 impl DriverControl for RemoteDriverControl {
-    fn prompt(&self, prompt: String) {
-        self.notify(waku_client::Command::Prompt { prompt });
+    fn prompt(&self, turn: waku_client::TurnPrompt) {
+        self.notify(waku_client::Command::Prompt { turn });
     }
 
     fn supports_steer(&self) -> bool {

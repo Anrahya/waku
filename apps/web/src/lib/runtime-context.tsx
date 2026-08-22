@@ -22,6 +22,7 @@ import { toast } from 'sonner'
 import { useDaemon } from './daemon-context'
 import { translate, useI18n } from './i18n'
 import {
+  acceptTurnSubmission,
   attachSession as attachDaemonSession,
   beginTurn,
   captureTurnCheckpoint,
@@ -32,7 +33,9 @@ import {
   materializeWorktree,
   persistSession,
   probeProvider,
+  queueSubmission,
   sessionCwd,
+  type AcceptedTurnSubmission,
   type TaskState,
 } from './daemon-api'
 import {
@@ -116,12 +119,14 @@ interface RuntimeContextValue {
     prompt: string,
     attachments?: MessageAttachment[],
     providerPromptOverride?: string,
+    acceptedTurnId?: string,
   ) => Promise<void>
   steerPrompt: (
     session: AgentSession,
     prompt: string,
     attachments?: MessageAttachment[],
     providerPromptOverride?: string,
+    acceptedTurnId?: string,
   ) => Promise<void>
   cancel: (sessionId: string) => Promise<void>
   closeSession: (sessionId: string) => Promise<void>
@@ -163,14 +168,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const saveGenerations = useRef(new Map<string, number>())
   const sendPromptRef = useRef<RuntimeContextValue['sendPrompt'] | null>(null)
   const pendingSteers = useRef(
-    new Map<
-      string,
-      Array<{
-        providerPrompt: string
-        displayContent: string
-        attachments: MessageAttachment[]
-      }>
-    >(),
+    new Map<string, AcceptedTurnSubmission[]>(),
   )
   const responseForksInFlight = useRef(new Map<string, number>())
   const messageRewindsInFlight = useRef(new Map<string, number>())
@@ -420,6 +418,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             nextQueued.display_content ?? nextQueued.content,
             nextQueued.attachments ?? [],
             nextQueued.content,
+            nextQueued.id,
           )
         })
         .catch((error) => toast.error(errorMessage(error)))
@@ -497,12 +496,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         } else if (event.event.kind === 'steerRejected') {
           const pending = pendingSteers.current.get(session.id)?.shift()
           if (pending) {
-            current = queueSubmission(
-              current,
-              pending.displayContent,
-              pending.providerPrompt,
-              pending.attachments,
-            )
+            current = queueSubmission(current, pending)
             cacheSession(current)
             void persistOrdered(current).catch((error) => toast.error(errorMessage(error)))
             toast.error(translate(localeRef.current, 'session.steer_rejected_plain'))
@@ -612,20 +606,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       rawPrompt: string,
       attachments: MessageAttachment[] = [],
       providerPromptOverride?: string,
+      acceptedTurnId?: string,
     ) => {
       if (!client || !config || phase !== 'connected') {
         throw new Error(translate(localeRef.current, 'errors.daemon_disconnected'))
       }
-      const prompt = rawPrompt.trim()
-      if (!prompt && attachments.length === 0) return
-      const providerPrompt = providerPromptOverride === undefined
-        ? [
-            prompt,
-            attachments.map((attachment) => `@${attachment.mention}`).join(' '),
-          ]
-            .filter(Boolean)
-            .join(' ')
-        : providerPromptOverride.trim()
+      const submission = acceptTurnSubmission(
+        rawPrompt,
+        attachments,
+        providerPromptOverride,
+        acceptedTurnId,
+      )
+      if (!submission) return
       const currentSession = queryClient.getQueryData<AgentSession>(
         daemonKeys.session(config.address, inputSession.id),
       ) ?? inputSession
@@ -635,7 +627,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         currentSession.status === 'waiting' ||
         checkpointCaptures.current.has(currentSession.id)
       ) {
-        const queued = queueSubmission(currentSession, prompt, providerPrompt, attachments)
+        const queued = queueSubmission(currentSession, submission)
         cacheSession(queued)
         await persistOrdered(queued)
         return
@@ -645,7 +637,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         await attachSession(currentSession)
       }
 
-      let session = beginTurn(currentSession, prompt, attachments)
+      let session = beginTurn(
+        currentSession,
+        submission.turnId,
+        submission.displayContent,
+        submission.attachments,
+      )
       cacheSession(session)
 
       let project: Project
@@ -691,7 +688,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           client,
           session,
           project,
-          prompt || attachments[0]?.name || 'task',
+          submission.displayContent || submission.attachments[0]?.name || 'task',
         )
         const turnCount = session.turns.at(-1)?.turn_count
         if (turnCount !== undefined) {
@@ -754,7 +751,10 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           }))
         }
         await client.request(
-          { type: 'prompt', prompt: providerPrompt },
+          {
+            type: 'prompt',
+            turn: { id: submission.turnId, prompt: submission.providerPrompt },
+          },
           session.id,
           runtime.runtimeId,
         )
@@ -789,18 +789,23 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   sendPromptRef.current = sendPrompt
 
   const steerPrompt = useCallback<RuntimeContextValue['steerPrompt']>(
-    async (session, rawPrompt, attachments = [], providerPromptOverride) => {
+    async (
+      session,
+      rawPrompt,
+      attachments = [],
+      providerPromptOverride,
+      acceptedTurnId,
+    ) => {
       if (!client || phase !== 'connected') {
         throw new Error(translate(localeRef.current, 'errors.daemon_disconnected'))
       }
-      const prompt = rawPrompt.trim()
-      if (!prompt && attachments.length === 0) return
-      const providerPrompt = providerPromptOverride === undefined
-        ? [
-            prompt,
-            attachments.map((attachment) => `@${attachment.mention}`).join(' '),
-          ].filter(Boolean).join(' ')
-        : providerPromptOverride.trim()
+      const submission = acceptTurnSubmission(
+        rawPrompt,
+        attachments,
+        providerPromptOverride,
+        acceptedTurnId,
+      )
+      if (!submission) return
       const runtime = entries.current.get(session.id)
       if (
         !runtime ||
@@ -809,13 +814,23 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         session.status === 'idle' ||
         session.status === 'failed'
       ) {
-        await sendPrompt(session, prompt, attachments, providerPrompt)
+        await sendPrompt(
+          session,
+          submission.displayContent,
+          submission.attachments,
+          submission.providerPrompt,
+          submission.turnId,
+        )
         return
       }
       const pending = pendingSteers.current.get(session.id) ?? []
-      pending.push({ providerPrompt, displayContent: prompt, attachments })
+      pending.push(submission)
       pendingSteers.current.set(session.id, pending)
-      await client.request({ type: 'steer', prompt: providerPrompt }, session.id, runtime.runtimeId)
+      await client.request(
+        { type: 'steer', prompt: submission.providerPrompt },
+        session.id,
+        runtime.runtimeId,
+      )
     },
     [client, phase, sendPrompt],
   )
@@ -1126,30 +1141,6 @@ function removeRecordKey<T>(record: Record<string, T>, key: string): Record<stri
   const next = { ...record }
   delete next[key]
   return next
-}
-
-function queueSubmission(
-  session: AgentSession,
-  displayContent: string,
-  providerPrompt: string,
-  attachments: MessageAttachment[],
-): AgentSession {
-  return {
-    ...session,
-    updated_at: Math.floor(Date.now() / 1_000),
-    queued_messages: [
-      ...(session.queued_messages ?? []),
-      {
-        id: crypto.randomUUID(),
-        content: providerPrompt,
-        display_content: attachments.length || providerPrompt !== displayContent
-          ? displayContent
-          : null,
-        attachments,
-        created_at: Math.floor(Date.now() / 1_000),
-      },
-    ],
-  }
 }
 
 export function useRuntime() {

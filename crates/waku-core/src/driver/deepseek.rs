@@ -26,6 +26,7 @@ use crate::model::{
     BackgroundWorkStatus, DriverEvent, InteractionMode, PermissionOption, ProviderResumeCursor,
     ReportedCommand, RuntimeMode, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
+use waku_protocol::TurnPrompt;
 
 enum CommandMessage {
     Prompt(String),
@@ -265,8 +266,8 @@ impl DeepSeekDriver {
 }
 
 impl DriverControl for DeepSeekDriver {
-    fn prompt(&self, prompt: String) {
-        let _ = self.commands.send(CommandMessage::Prompt(prompt));
+    fn prompt(&self, turn: TurnPrompt) {
+        let _ = self.commands.send(CommandMessage::Prompt(turn.prompt));
     }
 
     fn supports_steer(&self) -> bool {

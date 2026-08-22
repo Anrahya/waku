@@ -2124,6 +2124,7 @@ impl Waku {
         let display_content = (!attachments.is_empty()).then(|| prompt.trim().to_owned());
         self.discard_current_composer_draft(cx);
         Some(ComposerSubmission {
+            id: Uuid::new_v4(),
             prompt: submission,
             display_content,
             attachments,

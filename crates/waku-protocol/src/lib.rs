@@ -43,6 +43,7 @@ pub mod provider_session;
 pub mod settings;
 pub mod skills;
 pub mod theme;
+pub mod turn;
 pub mod usage;
 pub mod usage_history;
 pub mod workspace;
@@ -57,4 +58,5 @@ pub use protocol::{
     WireDriverEvent, WireDriverStartOptions, WireSessionOptions,
 };
 pub use settings::DaemonSettings;
+pub use turn::TurnPrompt;
 pub use workspace::{WorkspaceOperation, WorkspaceResult};

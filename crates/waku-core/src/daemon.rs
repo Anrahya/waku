@@ -1485,7 +1485,7 @@ fn handle_driver_command(
     command: Command,
 ) -> anyhow::Result<ResponsePayload> {
     match command {
-        Command::Prompt { prompt } => driver.prompt(prompt),
+        Command::Prompt { turn } => driver.prompt(turn),
         Command::Steer { prompt } => driver.steer(prompt),
         Command::Cancel => driver.cancel(),
         Command::CancelComputerUse => driver.cancel_computer_use(),
@@ -1843,6 +1843,46 @@ struct TurnFinishedWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingPromptDriver {
+        prompts: Mutex<Vec<waku_protocol::TurnPrompt>>,
+    }
+
+    impl crate::driver::DriverControl for RecordingPromptDriver {
+        fn prompt(&self, turn: waku_protocol::TurnPrompt) {
+            self.prompts.lock().push(turn);
+        }
+
+        fn cancel(&self) {}
+
+        fn respond(&self, _request_id: String, _option_id: String) {}
+
+        fn rollback(&self, _turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn prompt_command_reaches_core_driver_with_the_same_identity() {
+        let id = Uuid::from_u128(7);
+        let recording = Arc::new(RecordingPromptDriver::default());
+        let driver = DriverHandle::from_control(recording.clone());
+
+        let response = handle_driver_command(
+            &driver,
+            Command::Prompt {
+                turn: waku_protocol::TurnPrompt::new(id, "Build it"),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(response, ResponsePayload::Ack));
+        assert_eq!(
+            recording.prompts.lock().as_slice(),
+            [waku_protocol::TurnPrompt::new(id, "Build it")]
+        );
+    }
 
     #[test]
     fn stale_runtime_projection_keeps_newer_transcript_cursor() {

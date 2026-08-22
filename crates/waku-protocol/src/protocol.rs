@@ -12,11 +12,12 @@ use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatc
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
 use crate::settings::DaemonSettings;
 use crate::skills::SkillsCatalog;
+use crate::turn::TurnPrompt;
 use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -84,7 +85,7 @@ pub enum Command {
         options: WireDriverStartOptions,
     },
     Prompt {
-        prompt: String,
+        turn: TurnPrompt,
     },
     Steer {
         prompt: String,
@@ -499,7 +500,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]
@@ -508,7 +509,35 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn prompt_command_requires_a_typed_turn_identity() {
+        let id = Uuid::from_u128(7);
+        let command = Command::Prompt {
+            turn: TurnPrompt {
+                id,
+                prompt: "Build it".into(),
+            },
+        };
+        let json = serde_json::to_value(&command).unwrap();
+
+        assert_eq!(json["type"], "prompt");
+        assert_eq!(json["turn"]["id"], id.to_string());
+        assert_eq!(json["turn"]["prompt"], "Build it");
+        assert!(serde_json::from_value::<Command>(json).is_ok());
+
+        for invalid in [
+            serde_json::json!({"type": "prompt"}),
+            serde_json::json!({"type": "prompt", "turn": {"prompt": "Build it"}}),
+            serde_json::json!({
+                "type": "prompt",
+                "turn": {"id": "not-a-uuid", "prompt": "Build it"}
+            }),
+        ] {
+            assert!(serde_json::from_value::<Command>(invalid).is_err());
+        }
     }
 
     #[test]

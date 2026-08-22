@@ -27,6 +27,7 @@ use crate::model::{
     ProviderResumeCursor, RuntimeMode, UserInputAnswer, UserInputOption, UserInputQuestion,
     unix_time_millis,
 };
+use waku_protocol::TurnPrompt;
 
 const DISABLE_EXTERNAL_COMPUTER_USE_PLUGIN: &str =
     "plugins.computer-use@openai-bundled.enabled=false";
@@ -842,8 +843,8 @@ fn toml_string(value: &str) -> String {
 }
 
 impl DriverControl for CodexDriver {
-    fn prompt(&self, prompt: String) {
-        let _ = self.commands.send(CommandMessage::Prompt(prompt));
+    fn prompt(&self, turn: TurnPrompt) {
+        let _ = self.commands.send(CommandMessage::Prompt(turn.prompt));
     }
 
     fn supports_steer(&self) -> bool {
