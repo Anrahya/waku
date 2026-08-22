@@ -1576,8 +1576,8 @@ impl Waku {
             }));
 
         let mut rows = div().mt(px(4.0)).flex().flex_col();
-        let provider_count = ProviderKind::ALL.len();
-        for (index, kind) in ProviderKind::ALL.into_iter().enumerate() {
+        let provider_count = ProviderKind::SELECTABLE.len();
+        for (index, kind) in ProviderKind::SELECTABLE.into_iter().enumerate() {
             let probe = self.provider_probe(kind);
             let installed = probe.is_some_and(|probe| probe.installed);
             let binary_path = probe
@@ -1967,7 +1967,7 @@ impl Waku {
             self.state.disabled_providers.push(provider);
         }
         if !enabled
-            && let Some(fallback) = ProviderKind::ALL
+            && let Some(fallback) = ProviderKind::SELECTABLE
                 .into_iter()
                 .find(|kind| self.provider_enabled(*kind))
         {

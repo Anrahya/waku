@@ -63,7 +63,8 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         | ProviderKind::Kimi
         | ProviderKind::OpenCode
         | ProviderKind::OhMyPi
-        | ProviderKind::Pi => Vec::new(),
+        | ProviderKind::Pi
+        | ProviderKind::Renoa => Vec::new(),
         ProviderKind::Grok => vec![ProviderModel::new("grok-build", "Grok Build").default()],
     }
 }

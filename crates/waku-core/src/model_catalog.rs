@@ -85,8 +85,11 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         }
         // Pi, Oh My Pi, and Kimi Code all take their catalog from the user's
         // configured LLM providers. A fabricated fallback would make
-        // unavailable models look selectable.
-        ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi => Vec::new(),
+        // unavailable models look selectable. Renoa's catalog is owned by the
+        // ACP process and is not selected in this slice.
+        ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi | ProviderKind::Renoa => {
+            Vec::new()
+        }
     }
 }
 
@@ -131,6 +134,7 @@ pub fn discover_catalog(
         ProviderKind::Kimi => (discover_kimi_models(binary), None),
         ProviderKind::Pi => (discover_pi_models(binary, PiDialect::Pi), None),
         ProviderKind::OhMyPi => (discover_pi_models(binary, PiDialect::OhMyPi), None),
+        ProviderKind::Renoa => (Vec::new(), None),
     };
     let models = if discovered.is_empty() {
         // A failed or empty probe keeps the last successful discovery over

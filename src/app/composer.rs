@@ -860,7 +860,7 @@ impl Waku {
                             .is_some_and(|session| !session.messages.is_empty());
                         let provider =
                             if !locked && this.state.disabled_providers.contains(&provider) {
-                                ProviderKind::ALL
+                                ProviderKind::SELECTABLE
                                     .into_iter()
                                     .find(|kind| this.provider_enabled(*kind))
                                     .unwrap_or(provider)
@@ -1012,7 +1012,7 @@ impl Waku {
                 // One predicate with the `tab` cycle, so clicking and cycling
                 // agree on which tabs are usable.
                 let rail_tabs = visible_picker_tabs(&probes, &disabled_providers, locked_provider);
-                for kind in ProviderKind::ALL {
+                for kind in ProviderKind::SELECTABLE {
                     // A provider with no CLI on the machine, or one switched
                     // off in the Providers settings, leaves the rail entirely
                     // rather than sitting there dimmed: a tab that can never
@@ -3627,7 +3627,7 @@ pub(super) fn visible_picker_tabs(
     locked_provider: Option<ProviderKind>,
 ) -> Vec<ModelPickerTab> {
     let mut tabs = vec![ModelPickerTab::Favorites];
-    tabs.extend(ProviderKind::ALL.into_iter().filter_map(|kind| {
+    tabs.extend(ProviderKind::SELECTABLE.into_iter().filter_map(|kind| {
         let drawn = picker_rail_shows_provider(probes, disabled_providers, locked_provider, kind);
         let allowed = locked_provider.is_none() || locked_provider == Some(kind);
         (drawn && allowed).then_some(ModelPickerTab::Provider(kind))
@@ -3786,7 +3786,7 @@ pub(super) fn picker_has_no_providers(
     detection_settled: bool,
 ) -> bool {
     detection_settled
-        && !ProviderKind::ALL.into_iter().any(|kind| {
+        && !ProviderKind::SELECTABLE.into_iter().any(|kind| {
             picker_rail_shows_provider(probes, disabled_providers, locked_provider, kind)
         })
 }

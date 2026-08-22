@@ -86,6 +86,9 @@ pub fn generate_message(
     include_unstaged: bool,
     invocation: &AgentInvocation,
 ) -> anyhow::Result<String> {
+    if invocation.provider == ProviderKind::Renoa {
+        bail!("Renoa cannot generate a commit message");
+    }
     let prompt = commit_prompt(cwd, include_unstaged)?;
     let amp_settings = if invocation.provider == ProviderKind::Amp {
         let path = std::env::temp_dir().join(format!("waku-amp-commit-{}.json", Uuid::new_v4()));
@@ -380,6 +383,7 @@ fn agent_arguments(
                 push(&mut args, effort);
             }
         }
+        ProviderKind::Renoa => {}
     }
     push(&mut args, prompt);
     args
@@ -729,7 +733,7 @@ mod tests {
     #[test]
     fn every_provider_uses_a_noninteractive_generation_mode() {
         let prompt = "Generate subject";
-        for provider in ProviderKind::ALL {
+        for provider in ProviderKind::SELECTABLE {
             let args = agent_arguments(
                 provider,
                 Some("model"),
@@ -802,6 +806,9 @@ mod tests {
                     assert!(has_pair(&args, "--output-format", "text"));
                     assert!(has_pair(&args, "--model", "model"));
                 }
+                ProviderKind::Renoa => {
+                    unreachable!("Renoa is omitted from ProviderKind::SELECTABLE")
+                }
             }
         }
     }
@@ -834,5 +841,25 @@ mod tests {
         assert!(has_pair(&codex, "-c", CODEX_COMMIT_EFFORT));
         assert!(!has(&codex, "gpt-5.6-sol"));
         assert!(!has(&codex, "high"));
+    }
+
+    #[test]
+    fn renoa_rejects_commit_message_generation() {
+        let error = generate_message(
+            Path::new("/tmp"),
+            false,
+            &AgentInvocation {
+                provider: ProviderKind::Renoa,
+                binary: PathBuf::from("/nonexistent/renoa-agent"),
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .expect_err("Renoa has no commit-message CLI");
+        assert!(
+            error
+                .to_string()
+                .contains("Renoa cannot generate a commit message")
+        );
     }
 }

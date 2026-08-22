@@ -440,6 +440,8 @@ impl PersistedState {
     }
 
     pub fn new_session(&self, project_id: Uuid, provider: ProviderKind) -> AgentSession {
+        // A hidden provider never starts a task; its selectable fallback does.
+        let provider = provider.for_new_task();
         let mut session = AgentSession::new(project_id, provider);
         if provider == self.last_provider {
             session.model.clone_from(&self.last_model);
@@ -640,12 +642,16 @@ impl PersistedState {
         self.version = STATE_VERSION;
         normalize_computer_app_grants(&mut self.computer_use_allowed_apps);
         self.backfill_remembered_selection();
+        self.normalize_hidden_selection();
     }
 
     fn backfill_remembered_selection(&mut self) {
         let Some(session) = self
             .selected_session
             .and_then(|selected| self.sessions.iter().find(|session| session.id == selected))
+            // A hidden provider's session must not seed the remembered
+            // selection for future tasks.
+            .filter(|session| session.provider.is_selectable())
             .cloned()
         else {
             return;
@@ -662,6 +668,21 @@ impl PersistedState {
         if self.last_context_window.is_none() {
             self.last_context_window = session.context_window;
         }
+    }
+
+    /// A hidden provider must not become the default for future tasks. Its
+    /// remembered model and traits describe that provider's models, so they
+    /// are dropped instead of seeding its fallback provider's drafts.
+    /// Restored sessions keep their own provider untouched.
+    fn normalize_hidden_selection(&mut self) {
+        if self.last_provider.is_selectable() {
+            return;
+        }
+        self.last_provider = self.last_provider.for_new_task();
+        self.last_model = None;
+        self.last_reasoning_effort = None;
+        self.last_service_tier = None;
+        self.last_context_window = None;
     }
 }
 
@@ -1091,6 +1112,69 @@ mod tests {
         restore_task_state_skeletons(&mut sessions);
         assert!(!sessions[0].detail_loaded);
         assert!(sessions[0].has_started());
+    }
+
+    #[test]
+    fn stale_hidden_renoa_selection_loads_as_a_clean_codex_draft() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+        let known = state
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+
+        // Stale serialized app state: Renoa is remembered as the next
+        // provider together with its model traits, while the recorded
+        // selected session no longer exists.
+        let app_state: AppState = serde_json::from_value(serde_json::json!({
+            "app_state_version": APP_STATE_VERSION,
+            "selected_project": project_id,
+            "selected_session": Uuid::new_v4(),
+            "last_provider": "renoa",
+            "last_model": "renoa-alpha",
+            "last_reasoning_effort": "high",
+            "last_service_tier": "fast",
+            "last_context_window": "262144",
+        }))
+        .unwrap();
+        state.apply_app_state(app_state);
+        state.migrate_loaded();
+        state.ensure_runtime_session();
+
+        assert_eq!(state.last_provider, ProviderKind::Codex);
+        assert_eq!(state.last_model, None);
+        assert_eq!(state.last_reasoning_effort, None);
+        assert_eq!(state.last_service_tier, None);
+        assert_eq!(state.last_context_window, None);
+
+        let draft_id = state.selected_session.unwrap();
+        assert!(
+            !known.contains(&draft_id),
+            "the dangling selection must not resolve to an existing session"
+        );
+        let draft = state
+            .sessions
+            .iter()
+            .find(|session| session.id == draft_id)
+            .expect("a draft exists for the missing selection");
+        assert_eq!(draft.provider, ProviderKind::Codex);
+        assert_eq!(draft.model, None);
+        assert_eq!(draft.reasoning_effort, None);
+        assert_eq!(draft.service_tier, None);
+        assert_eq!(draft.context_window, None);
+    }
+
+    #[test]
+    fn backfill_skips_a_hidden_selected_session() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].provider = ProviderKind::Renoa;
+        state.sessions[0].model = Some("renoa-alpha".into());
+        state.selected_session = Some(state.sessions[0].id);
+
+        state.backfill_remembered_selection();
+
+        assert_eq!(state.last_model, None);
     }
 }
 

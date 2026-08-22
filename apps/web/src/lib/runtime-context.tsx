@@ -19,6 +19,7 @@ import {
   type ReactNode,
 } from 'react'
 import { toast } from 'sonner'
+import { providerMeta } from '@/components/waku-icon'
 import { useDaemon } from './daemon-context'
 import { translate, useI18n } from './i18n'
 import {
@@ -1206,21 +1207,7 @@ function syntheticEvent(
 }
 
 function providerName(provider: AgentSession['provider']) {
-  return (
-    {
-      amp: 'Amp',
-      claude: 'Claude Code',
-      codex: 'Codex',
-      cursor: 'Cursor Agent',
-      deepSeek: 'DeepSeek Harness',
-      fx: 'Fx',
-      openCode: 'OpenCode',
-      grok: 'Grok',
-      kimi: 'Kimi',
-      ohMyPi: 'Oh My Pi',
-      pi: 'Pi',
-    } as const
-  )[provider]
+  return providerMeta(provider).name
 }
 
 function errorMessage(error: unknown) {

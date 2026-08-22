@@ -69,6 +69,41 @@ describe('composer preferences', () => {
 
     expect(readComposerPreferences(storage, 'ws://first').lastProvider).toBe('fx')
   })
+
+  test('does not treat a hidden Renoa provider as a selectable preference', () => {
+    const storage = memoryStorage()
+    storage.setItem(
+      'waku.composer-preferences.v1',
+      JSON.stringify({
+        'ws://first': {
+          lastProvider: 'renoa',
+          lastModel: 'ignored',
+          lastReasoningEffort: null,
+          lastServiceTier: null,
+          lastContextWindow: null,
+          modelTraits: {},
+        },
+      }),
+    )
+
+    expect(readComposerPreferences(storage, 'ws://first').lastProvider).toBe('codex')
+  })
+
+  test('does not remember a hidden Renoa session as the next-task provider', () => {
+    const remembered = rememberComposerSession(
+      readComposerPreferences(null, 'ws://first'),
+      {
+        provider: 'renoa',
+        model: 'alpha',
+        reasoning_effort: null,
+        service_tier: null,
+        context_window: null,
+      },
+    )
+
+    expect(remembered.lastProvider).toBe('codex')
+    expect(remembered.lastModel).toBeNull()
+  })
 })
 
 function memoryStorage() {

@@ -334,6 +334,25 @@ const PROVIDER_ICONS: Record<ProviderKind, string> = {
   kimi: 'i-waku-provider-kimi',
   ohMyPi: 'i-waku-provider-ohmypi',
   pi: 'i-waku-provider-pi',
+  renoa: 'i-waku-bot',
+}
+
+const PROVIDER_METADATA: Record<
+  ProviderKind,
+  { name: string; shortName: string; command: string }
+> = {
+  amp: { name: 'Amp', shortName: 'Amp', command: 'amp' },
+  claude: { name: 'Claude Code', shortName: 'Claude', command: 'claude' },
+  codex: { name: 'Codex CLI', shortName: 'Codex', command: 'codex' },
+  cursor: { name: 'Cursor CLI', shortName: 'Cursor', command: 'cursor-agent' },
+  deepSeek: { name: 'DeepSeek Harness', shortName: 'DeepSeek', command: 'dsh' },
+  fx: { name: 'Fx', shortName: 'Fx', command: 'fx' },
+  openCode: { name: 'OpenCode', shortName: 'OpenCode', command: 'opencode' },
+  grok: { name: 'Grok Build', shortName: 'Grok', command: 'grok' },
+  kimi: { name: 'Kimi Code', shortName: 'Kimi', command: 'kimi' },
+  ohMyPi: { name: 'Oh My Pi', shortName: 'Oh My Pi', command: 'omp' },
+  pi: { name: 'Pi', shortName: 'Pi', command: 'pi' },
+  renoa: { name: 'Renoa', shortName: 'Renoa', command: 'renoa-agent' },
 }
 
 export const PROVIDERS: Array<{
@@ -341,22 +360,24 @@ export const PROVIDERS: Array<{
   name: string
   shortName: string
   command: string
-}> = [
-  { id: 'amp', name: 'Amp', shortName: 'Amp', command: 'amp' },
-  { id: 'claude', name: 'Claude Code', shortName: 'Claude', command: 'claude' },
-  { id: 'codex', name: 'Codex CLI', shortName: 'Codex', command: 'codex' },
-  { id: 'cursor', name: 'Cursor CLI', shortName: 'Cursor', command: 'cursor-agent' },
-  { id: 'deepSeek', name: 'DeepSeek Harness', shortName: 'DeepSeek', command: 'dsh' },
-  { id: 'fx', name: 'Fx', shortName: 'Fx', command: 'fx' },
-  { id: 'openCode', name: 'OpenCode', shortName: 'OpenCode', command: 'opencode' },
-  { id: 'grok', name: 'Grok Build', shortName: 'Grok', command: 'grok' },
-  { id: 'kimi', name: 'Kimi Code', shortName: 'Kimi', command: 'kimi' },
-  { id: 'ohMyPi', name: 'Oh My Pi', shortName: 'Oh My Pi', command: 'omp' },
-  { id: 'pi', name: 'Pi', shortName: 'Pi', command: 'pi' },
-]
+}> = (
+  [
+    'amp',
+    'claude',
+    'codex',
+    'cursor',
+    'deepSeek',
+    'fx',
+    'openCode',
+    'grok',
+    'kimi',
+    'ohMyPi',
+    'pi',
+  ] as const
+).map((id) => ({ id, ...PROVIDER_METADATA[id] }))
 
 export function providerMeta(provider: ProviderKind) {
-  return PROVIDERS.find((candidate) => candidate.id === provider) ?? PROVIDERS[2]!
+  return { id: provider, ...PROVIDER_METADATA[provider] }
 }
 
 export function ProviderIcon({

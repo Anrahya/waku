@@ -2040,3 +2040,30 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
         ProviderKind::Claude
     ));
 }
+
+#[test]
+fn a_hidden_renoa_provider_never_joins_the_picker() {
+    use super::ModelPickerTab;
+    use super::composer::{picker_has_no_providers, visible_picker_tabs};
+    use crate::model::{ProviderModel, ProviderProbe};
+
+    let probe = |provider: ProviderKind, installed: bool| ProviderProbe {
+        provider,
+        installed,
+        path: installed.then(|| std::path::PathBuf::from(format!("/bin/{}", provider.id()))),
+        models: vec![ProviderModel::new("model", "model")],
+        agent_presets: Vec::new(),
+    };
+    let probes = [
+        probe(ProviderKind::Codex, false),
+        probe(ProviderKind::Renoa, true),
+    ];
+
+    assert_eq!(
+        visible_picker_tabs(&probes, &[], None),
+        vec![ModelPickerTab::Favorites]
+    );
+    assert!(picker_has_no_providers(&probes, &[], None, true));
+    assert!(!ProviderKind::SELECTABLE.contains(&ProviderKind::Renoa));
+    assert_eq!(ProviderKind::Renoa.for_new_task(), ProviderKind::Codex);
+}

@@ -92,7 +92,7 @@ export function rememberComposerSession(
     'provider' | 'model' | 'reasoning_effort' | 'service_tier' | 'context_window'
   >,
 ): ComposerPreferences {
-  if (!session.model) return preferences
+  if (!session.model || !PROVIDERS.has(session.provider)) return preferences
   const reasoningEffort = session.reasoning_effort ?? null
   const serviceTier = session.service_tier ?? null
   const contextWindow = session.context_window ?? null

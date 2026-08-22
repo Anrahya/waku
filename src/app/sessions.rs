@@ -179,11 +179,13 @@ impl Waku {
             })
         {
             self.state.selected_project = Some(project_id);
-            self.state.last_provider = provider;
-            self.state.last_model = model;
-            self.state.last_reasoning_effort = reasoning_effort;
-            self.state.last_service_tier = service_tier;
-            self.state.last_context_window = context_window;
+            if provider.is_selectable() {
+                self.state.last_provider = provider;
+                self.state.last_model = model;
+                self.state.last_reasoning_effort = reasoning_effort;
+                self.state.last_service_tier = service_tier;
+                self.state.last_context_window = context_window;
+            }
         }
         if self
             .selected_session()
@@ -896,7 +898,9 @@ impl Waku {
             session.reasoning_effort.clone_from(&reasoning_effort);
             session.service_tier.clone_from(&service_tier);
             session.context_window.clone_from(&context_window);
-            self.state.last_provider = provider;
+            if provider.is_selectable() {
+                self.state.last_provider = provider;
+            }
             self.state.last_model = Some(model);
             self.state.last_reasoning_effort = reasoning_effort;
             self.state.last_service_tier = service_tier;

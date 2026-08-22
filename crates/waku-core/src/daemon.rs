@@ -1045,7 +1045,7 @@ impl WakuBackend {
             }
             // Unreachable through the UI, which hides branching for providers
             // that answer `supports_conversation_fork` with false.
-            ProviderKind::Fx | ProviderKind::Kimi => {
+            ProviderKind::Fx | ProviderKind::Kimi | ProviderKind::Renoa => {
                 bail!(
                     "{} cannot branch a conversation at a turn",
                     source.provider.display_name()
@@ -1248,7 +1248,7 @@ impl WakuBackend {
             )),
             // Unreachable through the UI, which hides rewinding for providers
             // that answer `supports_conversation_rollback` with false.
-            ProviderKind::Fx | ProviderKind::Kimi => {
+            ProviderKind::Fx | ProviderKind::Kimi | ProviderKind::Renoa => {
                 bail!(
                     "{} cannot rewind a conversation to a turn",
                     source.provider.display_name()

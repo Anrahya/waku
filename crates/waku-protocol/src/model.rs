@@ -22,10 +22,29 @@ pub enum ProviderKind {
     Kimi,
     OhMyPi,
     Pi,
+    Renoa,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 11] = [
+    /// Every provider the runtime can probe and start, including backends that
+    /// are not yet offered in picker or settings UI.
+    pub const ALL: [Self; 12] = [
+        Self::Amp,
+        Self::Claude,
+        Self::Codex,
+        Self::Cursor,
+        Self::DeepSeek,
+        Self::Fx,
+        Self::OpenCode,
+        Self::Grok,
+        Self::Kimi,
+        Self::OhMyPi,
+        Self::Pi,
+        Self::Renoa,
+    ];
+
+    /// Providers shown in picker, settings, and new-session selection.
+    pub const SELECTABLE: [Self; 11] = [
         Self::Amp,
         Self::Claude,
         Self::Codex,
@@ -38,6 +57,19 @@ impl ProviderKind {
         Self::OhMyPi,
         Self::Pi,
     ];
+
+    pub fn is_selectable(self) -> bool {
+        Self::SELECTABLE.contains(&self)
+    }
+
+    /// New-task default when `self` is hidden from provider selection.
+    pub fn for_new_task(self) -> Self {
+        if self.is_selectable() {
+            self
+        } else {
+            Self::Codex
+        }
+    }
 
     pub fn id(self) -> &'static str {
         match self {
@@ -52,6 +84,7 @@ impl ProviderKind {
             Self::Kimi => "kimi",
             Self::OhMyPi => "ohmypi",
             Self::Pi => "pi",
+            Self::Renoa => "renoa",
         }
     }
 
@@ -68,6 +101,7 @@ impl ProviderKind {
             Self::Kimi => "Kimi Code",
             Self::OhMyPi => "Oh My Pi",
             Self::Pi => "Pi",
+            Self::Renoa => "Renoa",
         }
     }
 
@@ -84,6 +118,7 @@ impl ProviderKind {
             Self::Kimi => "Kimi",
             Self::OhMyPi => "Oh My Pi",
             Self::Pi => "Pi",
+            Self::Renoa => "Renoa",
         }
     }
 
@@ -102,6 +137,7 @@ impl ProviderKind {
             Self::Kimi => "kimi",
             Self::OhMyPi => "omp",
             Self::Pi => "pi",
+            Self::Renoa => "renoa-agent",
         }
     }
 
@@ -206,6 +242,9 @@ pub enum ProviderResumeCursor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_file: Option<PathBuf>,
     },
+    Renoa {
+        session_id: String,
+    },
 }
 
 impl ProviderResumeCursor {
@@ -237,6 +276,7 @@ impl ProviderResumeCursor {
                 session_id: id,
                 session_file: None,
             },
+            ProviderKind::Renoa => Self::Renoa { session_id: id },
         }
     }
 
@@ -253,6 +293,7 @@ impl ProviderResumeCursor {
             Self::Kimi { .. } => ProviderKind::Kimi,
             Self::OhMyPi { .. } => ProviderKind::OhMyPi,
             Self::Pi { .. } => ProviderKind::Pi,
+            Self::Renoa { .. } => ProviderKind::Renoa,
         }
     }
 
@@ -267,7 +308,8 @@ impl ProviderResumeCursor {
             | Self::Grok { session_id }
             | Self::Kimi { session_id }
             | Self::OhMyPi { session_id, .. }
-            | Self::Pi { session_id, .. } => session_id,
+            | Self::Pi { session_id, .. }
+            | Self::Renoa { session_id } => session_id,
             Self::Codex { thread_id } => thread_id,
         }
     }
@@ -3841,6 +3883,14 @@ mod tests {
         assert_eq!(ProviderKind::OpenCode.command(), "opencode");
         assert_eq!(ProviderKind::Grok.command(), "grok");
         assert_eq!(ProviderKind::Pi.command(), "pi");
+        assert_eq!(ProviderKind::Renoa.id(), "renoa");
+        assert_eq!(ProviderKind::Renoa.display_name(), "Renoa");
+        assert_eq!(ProviderKind::Renoa.command(), "renoa-agent");
+        assert!(ProviderKind::ALL.contains(&ProviderKind::Renoa));
+        assert!(!ProviderKind::SELECTABLE.contains(&ProviderKind::Renoa));
+        assert!(!ProviderKind::Renoa.is_selectable());
+        assert_eq!(ProviderKind::Renoa.for_new_task(), ProviderKind::Codex);
+        assert_eq!(ProviderKind::Grok.for_new_task(), ProviderKind::Grok);
     }
 
     #[test]
@@ -3858,7 +3908,7 @@ mod tests {
             assert!(provider.supports_conversation_fork());
             assert!(provider.supports_conversation_rollback());
         }
-        for provider in [ProviderKind::Fx, ProviderKind::Kimi] {
+        for provider in [ProviderKind::Fx, ProviderKind::Kimi, ProviderKind::Renoa] {
             assert!(!provider.supports_conversation_fork());
             assert!(!provider.supports_conversation_rollback());
         }
@@ -3875,6 +3925,7 @@ mod tests {
         assert!(ProviderKind::OpenCode.supports_model_discovery());
         assert!(ProviderKind::Grok.supports_model_discovery());
         assert!(ProviderKind::Pi.supports_model_discovery());
+        assert!(!ProviderKind::Renoa.supports_model_discovery());
     }
 
     #[test]
@@ -4139,6 +4190,16 @@ mod tests {
         assert_eq!(value["provider"], "cursor");
         assert_eq!(value["sessionId"], "");
         assert_eq!(value["forkContext"], "[]");
+
+        let cursor = ProviderResumeCursor::from_session_id(
+            ProviderKind::Renoa,
+            "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f".into(),
+        );
+        assert_eq!(cursor.provider(), ProviderKind::Renoa);
+        assert_eq!(cursor.native_id(), "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f");
+        let value = serde_json::to_value(&cursor).unwrap();
+        assert_eq!(value["provider"], "renoa");
+        assert_eq!(value["sessionId"], "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f");
     }
 
     #[test]
