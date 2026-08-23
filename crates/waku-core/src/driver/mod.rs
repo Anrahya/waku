@@ -86,6 +86,13 @@ impl DriverHandle {
         self.inner.prompt(turn);
     }
 
+    /// Releases a provider that is waiting for its authoritative replay to be
+    /// durably committed. False means this transport cannot certify the
+    /// boundary and must remain fail-closed.
+    pub(crate) fn acknowledge_replay(&self) -> bool {
+        self.inner.acknowledge_replay()
+    }
+
     /// Whether this transport can inject a user message into the currently
     /// running turn (steering) instead of starting a new one.
     pub fn supports_steer(&self) -> bool {
@@ -143,6 +150,9 @@ impl DriverHandle {
 
 pub trait DriverControl: Send + Sync {
     fn prompt(&self, turn: TurnPrompt);
+    fn acknowledge_replay(&self) -> bool {
+        false
+    }
     fn supports_steer(&self) -> bool {
         false
     }

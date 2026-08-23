@@ -635,6 +635,8 @@ errors.task_not_loaded: このタスクは読み込まれていません
 errors.task_already_forking: このタスクはすでにフォーク中です
 errors.task_already_rewinding: このタスクはすでに巻き戻し中です
 errors.no_live_runtime: このタスクには実行中のエージェントがありません
+errors.renoa_web_replay_unsupported: 復元した Renoa セッションは、まだ Web クライアントでは開けません。プロンプトを送る前に Renoa の正式な履歴を突き合わせるには、デスクトップアプリを使ってください。
+errors.web_unsupported_runtime_event: Web クライアントはランタイムイベント %{kind} を適用できず、セッションカーソルを進めませんでした。
 errors.unexpected_daemon_response: "デーモンから %{expected} が返るはずでしたが、%{actual} を受信しました"
 errors.daemon_disconnected: Waku デーモンに接続されていません
 errors.path_outside_workspace: このパスはデーモンホスト上の現在のワークスペース外にあります

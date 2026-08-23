@@ -10,6 +10,7 @@ use crate::computer_use::ComputerPermissions;
 use crate::model::{AgentSession, Project, ProviderKind, ProviderProbe, UserInputAnswer};
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
+use crate::replay::{RenoaReplayBase, ReplayFragment};
 use crate::settings::DaemonSettings;
 use crate::skills::SkillsCatalog;
 use crate::turn::TurnPrompt;
@@ -17,8 +18,15 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
+/// Session replays are committed as bounded fragments so a long Renoa history
+/// never produces a wire message that exceeds [`MAX_WIRE_MESSAGE_BYTES`].
+pub const SESSION_REPLAY_FRAGMENT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum serialized size of one complete authoritative replay transaction.
+/// Individual supported values may span fragments, but an unbounded provider
+/// transcript is rejected before any fragment is emitted or applied.
+pub const SESSION_REPLAY_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
 pub const APP_EXECUTABLE_ENV: &str = "WAKU_APP_EXECUTABLE";
@@ -158,6 +166,15 @@ pub enum Command {
         projects: Vec<Project>,
         live_session_ids: Vec<Uuid>,
         sessions: Vec<AgentSession>,
+    },
+    /// Reads the exact daemon-side CAS base for a Renoa reconciliation without
+    /// sending the potentially large transcript back over the wire.
+    ReadRenoaReplayBase,
+    /// Atomically installs a validated Renoa transcript projection. Unlike an
+    /// ordinary task-state save this is acknowledgement-grade and cannot
+    /// overwrite session metadata or a different live runtime.
+    CommitRenoaReplay {
+        fragment: ReplayFragment,
     },
     /// Explicitly remove one daemon-owned task. Ordinary state saves are
     /// merge-only so a stale client snapshot cannot delete tasks another
@@ -392,6 +409,13 @@ pub enum ResponsePayload {
     TaskStateSaved {
         sessions: Vec<AgentSession>,
     },
+    RenoaReplayBase {
+        base: RenoaReplayBase,
+        session: Box<AgentSession>,
+    },
+    RenoaReplayCommitted {
+        session: AgentSession,
+    },
     Session {
         session: Option<AgentSession>,
     },
@@ -500,7 +524,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]
@@ -509,7 +533,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]

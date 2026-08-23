@@ -911,6 +911,12 @@ pub struct AgentSession {
     pub context_usage: Option<ContextUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_event_cursor: Option<RuntimeEventCursor>,
+    /// The replay event whose Renoa transcript replacement was durably
+    /// committed. A desktop reconnecting to the same daemon runtime can use
+    /// this marker to avoid requiring a transaction that its resume cursor
+    /// has already skipped. A replacement runtime must load and replay again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renoa_replay_cursor: Option<RuntimeEventCursor>,
     /// Read-only compatibility field for v1 state files. New saves omit it.
     #[serde(default, skip_serializing)]
     pub provider_session_id: Option<String>,
@@ -968,6 +974,7 @@ impl AgentSession {
             available_commands: Vec::new(),
             context_usage: None,
             runtime_event_cursor: None,
+            renoa_replay_cursor: None,
             provider_session_id: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
@@ -1004,6 +1011,7 @@ impl AgentSession {
             available_commands: Vec::new(),
             context_usage: None,
             runtime_event_cursor: None,
+            renoa_replay_cursor: None,
             provider_session_id: None,
             messages: Vec::new(),
             transcript_blocks: Vec::new(),
@@ -1672,6 +1680,18 @@ pub enum DriverEvent {
     /// Authoritative over filesystem discovery, which cannot see plugin or
     /// dynamically registered commands.
     AvailableCommands(Vec<ReportedCommand>),
+    /// One bounded batch of a provider's durable-history replay, committed
+    /// atomically after a successful `session/load`. Batches arrive ordered
+    /// and contiguous before [`DriverEvent::Connected`]; the consumer applies
+    /// nothing until every fragment of `total` has arrived, so a long history
+    /// never crosses the wire as one unbounded frame. Emitted once per loaded
+    /// process; never streamed live.
+    SessionReplayFragment {
+        replay_id: Uuid,
+        index: usize,
+        total: usize,
+        json: String,
+    },
     TurnStarted,
     TextDelta(String),
     ReasoningDelta(String),
@@ -1993,8 +2013,22 @@ pub struct ActivityItem {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
+    /// Complete provider-owned input when `arguments` is only a bounded UI
+    /// preview. Authoritative replay uses this for lossless durable state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoritative_arguments: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Complete provider-owned output when `output` is only a bounded UI
+    /// preview. Live activity keeps this empty; authoritative replay fills it
+    /// only when the complete value differs from the presentation string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoritative_output: Option<String>,
+    /// Complete ACP `rawOutput` beside the standard content result. Renoa can
+    /// provide both, and replay persistence must not discard the structured
+    /// diagnostic value merely because the UI presents `output`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoritative_raw_output: Option<String>,
     /// Images returned by a tool, kept separate from text so large data URLs
     /// are never truncated or treated as literal activity output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2040,7 +2074,10 @@ impl ActivityItem {
             title,
             detail,
             arguments: None,
+            authoritative_arguments: None,
             output: None,
+            authoritative_output: None,
+            authoritative_raw_output: None,
             image_urls: Vec::new(),
             failed: false,
             complete,
@@ -2064,6 +2101,17 @@ impl ActivityItem {
         self
     }
 
+    pub fn with_authoritative_arguments(mut self, arguments: Option<String>) -> Self {
+        self.authoritative_arguments = arguments;
+        self
+    }
+
+    pub fn durable_arguments(&self) -> Option<&str> {
+        self.authoritative_arguments
+            .as_deref()
+            .or(self.arguments.as_deref())
+    }
+
     pub fn with_activity_source(mut self, source: Option<&serde_json::Value>) -> Self {
         if let Some(source) = source {
             self.refresh_activity_metadata_from_value(source);
@@ -2075,6 +2123,28 @@ impl ActivityItem {
         self.output = output;
         self.refresh_command_output();
         self
+    }
+
+    pub fn with_authoritative_output(mut self, output: Option<String>) -> Self {
+        self.authoritative_output = output;
+        self
+    }
+
+    /// Complete durable result, falling back to the ordinary live output when
+    /// no separate replay value is needed.
+    pub fn durable_output(&self) -> Option<&str> {
+        self.authoritative_output
+            .as_deref()
+            .or(self.output.as_deref())
+    }
+
+    pub fn with_authoritative_raw_output(mut self, output: Option<String>) -> Self {
+        self.authoritative_raw_output = output;
+        self
+    }
+
+    pub fn durable_raw_output(&self) -> Option<&str> {
+        self.authoritative_raw_output.as_deref()
     }
 
     pub fn with_image_urls(mut self, image_urls: Vec<String>) -> Self {

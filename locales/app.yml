@@ -1235,6 +1235,10 @@ errors.task_already_rewinding:
   en: This task is already being rewound
 errors.no_live_runtime:
   en: This task has no live runtime
+errors.renoa_web_replay_unsupported:
+  en: "Restored Renoa sessions cannot be opened in the web client yet. Use the desktop app so Waku can reconcile Renoa's authoritative history before prompting."
+errors.web_unsupported_runtime_event:
+  en: "The web client cannot apply runtime event %{kind} and refused to advance the session cursor."
 errors.unexpected_daemon_response:
   en: "Expected %{expected}, received %{actual} from the daemon"
 errors.daemon_disconnected:

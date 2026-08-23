@@ -52,6 +52,21 @@ describe('reduceRuntimeEvent', () => {
     expect(result.session.messages.at(-1)?.streaming).toBe(false)
   })
 
+  test('sidecar control events still advance the cursor for ordinary providers', () => {
+    const result = reduceRuntimeEvent(
+      runningSession(),
+      event('planUsageUpdated', { used: 1, limit: 2 }),
+      clock,
+    )
+    expect(result.error).toBeUndefined()
+    expect(result.session.runtime_event_cursor).toEqual({
+      runtime_id: 'runtime',
+      epoch: 'epoch',
+      sequence: 1,
+    })
+    expect(result.session.status).toBe('connecting')
+  })
+
   test('does not turn a completed session into a failure when its process exits', () => {
     let session = runningSession()
     session = reduceRuntimeEvent(

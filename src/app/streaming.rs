@@ -235,11 +235,41 @@ impl Waku {
         runtime.last_active_at = Instant::now();
         match event {
             DriverEvent::RuntimeEventCursorAdvanced(cursor) => {
+                if self.accept_replay_cursor(session_id, runtime, cursor, cx) {
+                    return true;
+                }
                 if let Some(session) = self.state.session_mut(session_id) {
                     session.runtime_event_cursor = Some(cursor);
                 }
             }
+            DriverEvent::SessionReplayFragment {
+                replay_id,
+                index,
+                total,
+                json,
+            } => {
+                if let Err(error) = self.receive_session_replay_fragment(
+                    runtime,
+                    waku_protocol::replay::ReplayFragment {
+                        replay_id,
+                        index,
+                        total,
+                        json,
+                    },
+                ) {
+                    self.fail_session_replay(session_id, runtime, error);
+                    return true;
+                }
+            }
             DriverEvent::Connected { provider_cursor } => {
+                if !runtime.replay.connected_is_allowed() {
+                    self.fail_session_replay(
+                        session_id,
+                        runtime,
+                        replay::ReplayApplyError::ConnectedBeforeCommit,
+                    );
+                    return true;
+                }
                 runtime.last_driver_error = None;
                 runtime.last_background_refresh_at = Instant::now();
                 runtime.driver.refresh_background_work();
@@ -597,6 +627,7 @@ impl Waku {
             DriverEvent::Error(error) => {
                 let error = compact_driver_error(&error);
                 runtime.last_driver_error = Some(error.clone());
+                runtime.replay.fail();
                 if self.state.selected_session == Some(session_id) {
                     self.show_toast(error.clone());
                 }
@@ -628,6 +659,7 @@ impl Waku {
             }
             DriverEvent::ProcessExited => {
                 self.mark_background_work_lost(session_id);
+                runtime.replay.fail();
                 let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);

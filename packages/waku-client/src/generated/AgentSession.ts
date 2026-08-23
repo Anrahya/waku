@@ -60,6 +60,13 @@ available_commands?: Array<ReportedCommand>,
  */
 context_usage?: ContextUsage | null, runtime_event_cursor?: RuntimeEventCursor | null,
 /**
+ * The replay event whose Renoa transcript replacement was durably
+ * committed. A desktop reconnecting to the same daemon runtime can use
+ * this marker to avoid requiring a transaction that its resume cursor
+ * has already skipped. A replacement runtime must load and replay again.
+ */
+renoa_replay_cursor?: RuntimeEventCursor | null,
+/**
  * Read-only compatibility field for v1 state files. New saves omit it.
  */
 provider_session_id?: string | null,

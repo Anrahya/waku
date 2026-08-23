@@ -49,6 +49,7 @@ import {
   type PendingPermission,
   type PendingUserInput,
 } from './event-reducer'
+import { renoaWebRuntimeError } from './renoa-web-runtime'
 
 interface RuntimeSummary {
   runtimeId: string
@@ -571,6 +572,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       if (entries.current.has(session.id)) return Promise.resolve(true)
       const pending = attachRequests.current.get(session.id)
       if (pending) return pending
+      const blocked = renoaWebRuntimeError(session, localeRef.current)
+      if (blocked) {
+        toast.error(blocked)
+        return Promise.reject(new Error(blocked))
+      }
 
       const request = (async () => {
         const attached = await attachDaemonSession(client, session.id)
@@ -611,6 +617,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     ) => {
       if (!client || !config || phase !== 'connected') {
         throw new Error(translate(localeRef.current, 'errors.daemon_disconnected'))
+      }
+      const blocked = renoaWebRuntimeError(inputSession, localeRef.current)
+      if (blocked) {
+        toast.error(blocked)
+        throw new Error(blocked)
       }
       const submission = acceptTurnSubmission(
         rawPrompt,

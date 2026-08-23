@@ -299,6 +299,10 @@ pub struct PersistedState {
     /// out what moved.
     #[serde(skip)]
     dirty_sessions: HashSet<Uuid>,
+    /// Sessions whose message rows must be replaced exactly rather than using
+    /// the ordinary append/prefix optimization.
+    #[serde(skip)]
+    authoritative_message_replacements: HashSet<Uuid>,
 }
 
 impl PersistedState {
@@ -313,6 +317,11 @@ impl PersistedState {
     /// that mutate through a slice or add a session outright.
     pub fn mark_session_dirty(&mut self, id: Uuid) {
         self.dirty_sessions.insert(id);
+    }
+
+    pub(crate) fn mark_authoritative_message_replacement(&mut self, id: Uuid) {
+        self.dirty_sessions.insert(id);
+        self.authoritative_message_replacements.insert(id);
     }
 
     pub fn push_session(&mut self, session: AgentSession) {
@@ -348,6 +357,7 @@ impl PersistedState {
             provider_binary_overrides: HashMap::new(),
             daemon_settings_extra: BTreeMap::new(),
             dirty_sessions: HashSet::new(),
+            authoritative_message_replacements: HashSet::new(),
         }
     }
 
@@ -1240,6 +1250,7 @@ impl StateStore {
         session.context_window = stored.context_window;
         session.context_usage = stored.context_usage;
         session.runtime_event_cursor = stored.runtime_event_cursor;
+        session.renoa_replay_cursor = stored.renoa_replay_cursor;
 
         let mut statement = connection
             .prepare(
@@ -1393,6 +1404,9 @@ impl StateStore {
                     &transaction,
                     session,
                     storage.written_messages.get(&session.id).unwrap_or(&EMPTY),
+                    state
+                        .authoritative_message_replacements
+                        .contains(&session.id),
                 )?,
             ));
             storage.persisted_sessions.insert(session.id);
@@ -1428,6 +1442,7 @@ impl StateStore {
             storage.written_messages.insert(session_id, fingerprints);
         }
         state.dirty_sessions.clear();
+        state.authoritative_message_replacements.clear();
         Ok(())
     }
 
@@ -1531,6 +1546,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         available_commands: Vec::new(),
         context_usage: None,
         runtime_event_cursor: None,
+        renoa_replay_cursor: None,
         provider_session_id: None,
         messages: Vec::new(),
         transcript_blocks: Vec::new(),
@@ -1613,9 +1629,19 @@ fn write_messages(
     transaction: &Connection,
     session: &AgentSession,
     written: &HashMap<Uuid, u64>,
+    replace_exactly: bool,
 ) -> io::Result<HashMap<Uuid, u64>> {
     use rusqlite::types::Value;
     let session_id = session.id.to_string();
+    if replace_exactly {
+        transaction
+            .execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(to_io_error)?;
+    }
+    let written = if replace_exactly { &EMPTY } else { written };
     let mut current = HashMap::with_capacity(session.messages.len());
     for (position, message) in session.messages.iter().enumerate() {
         let fingerprint = message_fingerprint(message, position);
@@ -3591,6 +3617,83 @@ mod tests {
         state.backfill_remembered_selection();
 
         assert_eq!(state.last_model, None);
+    }
+
+    #[test]
+    fn a_reconciled_replay_transcript_survives_restart() {
+        use waku_protocol::replay::{
+            ProviderReplay, ReplayAssistantMessage, ReplayItem, ReplaySegment, ReplayUserMessage,
+        };
+
+        let turn = uuid::Uuid::new_v4();
+        let user_message_id = uuid::Uuid::new_v4();
+        let assistant_message_id = uuid::Uuid::new_v4();
+        let replay = ProviderReplay {
+            items: vec![
+                ReplayItem::UserMessage(ReplayUserMessage {
+                    message_id: user_message_id,
+                    turn_id: turn,
+                    text: "Fix the login bug".to_owned(),
+                }),
+                ReplayItem::AssistantMessage(ReplayAssistantMessage {
+                    message_id: assistant_message_id,
+                    segments: vec![
+                        ReplaySegment::Reasoning("thinking".to_owned()),
+                        ReplaySegment::Text("Done.".to_owned()),
+                    ],
+                }),
+            ],
+        };
+        let reconciled = waku_protocol::replay::reconcile_replay(&[], &[], &[], &replay, 5_000_000)
+            .expect("valid replay");
+
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session_id = state.sessions[0].id;
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.provider = ProviderKind::Renoa;
+            session.model = Some("renoa-alpha".into());
+            session.messages = reconciled.messages.clone();
+            session.transcript_blocks = reconciled.transcript_blocks.clone();
+            session.turns = reconciled.turns.clone();
+            // Mark the session started so it earns database rows.
+            session.begin_turn("keep-alive");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+        }
+        store.save(&mut state).unwrap();
+
+        let restored = load_hydrated(&store_in(&directory));
+        let session = restored
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("the reconciled session persists");
+        // Durable identities, order, reasoning work, and turn rebuild all
+        // survive the real storage boundary exactly once.
+        assert_eq!(session.messages[0].id, user_message_id);
+        assert_eq!(session.messages[0].turn_id, Some(turn));
+        assert_eq!(session.messages[0].content, "Fix the login bug");
+        assert_eq!(session.messages[1].id, assistant_message_id);
+        assert_eq!(session.messages[1].content, "Done.");
+        let reasoning = session
+            .transcript_blocks
+            .iter()
+            .flat_map(|block| block.activities.iter())
+            .find(|activity| activity.reasoning.is_some())
+            .expect("reasoning survives storage");
+        assert_eq!(
+            reasoning.source_id.as_deref(),
+            Some(assistant_message_id.to_string().as_str())
+        );
+        let rebuilt_turn = session
+            .turns
+            .iter()
+            .find(|candidate| candidate.id == turn)
+            .expect("the rebuilt turn persists");
+        assert_eq!(rebuilt_turn.status, crate::model::TurnStatus::Completed);
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]

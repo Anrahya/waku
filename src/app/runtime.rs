@@ -50,7 +50,11 @@ fn start_driver(mut request: DriverStartRequest, cwd: PathBuf) -> anyhow::Result
         request.options,
         event_tx,
     )?;
-    Ok(PreparedDriver { handle, events })
+    Ok(PreparedDriver {
+        handle,
+        events,
+        reused_runtime: None,
+    })
 }
 
 fn attach_driver(
@@ -84,7 +88,36 @@ fn attach_driver(
         session.runtime_event_cursor,
         event_tx,
     )?;
-    Ok(Some((session, PreparedDriver { handle, events })))
+    Ok(Some((
+        session,
+        PreparedDriver {
+            handle,
+            events,
+            reused_runtime: Some(runtime_id),
+        },
+    )))
+}
+
+fn renoa_replay_transaction_required(session: &AgentSession, reused_runtime: Option<Uuid>) -> bool {
+    if session.provider != ProviderKind::Renoa
+        || !matches!(
+            session.provider_cursor,
+            Some(ProviderResumeCursor::Renoa { .. })
+        )
+    {
+        return false;
+    }
+    let Some(reused_runtime) = reused_runtime else {
+        return true;
+    };
+    !matches!(
+        (session.renoa_replay_cursor, session.runtime_event_cursor),
+        (Some(committed), Some(resume))
+            if committed.runtime_id == reused_runtime
+                && committed.runtime_id == resume.runtime_id
+                && committed.epoch == resume.epoch
+                && committed.sequence <= resume.sequence
+    )
 }
 
 fn load_remote_task_state(
@@ -1106,6 +1139,9 @@ impl Waku {
                 if !self.runtimes.contains_key(&session_id) {
                     self.state.sessions[index] = session;
                     self.install_prepared_driver(session_id, prepared);
+                    // Attachment hydrates the session first; a replay buffered
+                    // before hydration can now be applied.
+                    self.apply_pending_session_replay(session_id, cx);
                     if self.state.selected_session == Some(session_id) {
                         self.reset_visible_state();
                         self.reset_transcript_rows(self.transcript_row_count());
@@ -2722,13 +2758,23 @@ impl Waku {
         prepared: PreparedDriver,
     ) -> DriverHandle {
         let handle = prepared.handle.clone();
+        let replay_required = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| {
+                renoa_replay_transaction_required(session, prepared.reused_runtime)
+            });
         self.runtimes.insert(
             session_id,
             SessionRuntime {
+                instance_id: Uuid::new_v4(),
                 driver: prepared.handle,
                 options_generation: 0,
                 events: prepared.events,
                 pending_events: VecDeque::new(),
+                replay: replay::SessionReplayState::new(replay_required),
                 pending_steers: VecDeque::new(),
                 stream_phase: None,
                 stream_remeasure_pending: false,
@@ -3387,8 +3433,21 @@ impl Waku {
             let mut runtime_changed = false;
             let mut background_changed = false;
             let mut markdown_changed = false;
+            let mut ui_only_changed = false;
             let mut keep_runtime = true;
-            while let Some(event) = runtime.pending_events.front() {
+            while !runtime.replay.blocks_event_drain()
+                && let Some(event) = runtime.pending_events.front()
+            {
+                if runtime.replay.failed()
+                    && !matches!(event, DriverEvent::Error(_) | DriverEvent::ProcessExited)
+                {
+                    // Once authoritative reconciliation fails, no later
+                    // provider content or cursor from that runtime can become
+                    // cache state. Keep only terminal lifecycle events so the
+                    // ordinary failure path can release the UI honestly.
+                    runtime.pending_events.pop_front();
+                    continue;
+                }
                 let kind = stream_delta_kind(event);
                 let event = if let Some(kind) = kind {
                     pop_stream_batch(&mut runtime.pending_events, kind)
@@ -3399,6 +3458,10 @@ impl Waku {
                     break;
                 };
                 let background_event = matches!(event, DriverEvent::BackgroundWork(_));
+                let replay_control_event =
+                    matches!(event, DriverEvent::SessionReplayFragment { .. })
+                        || (matches!(event, DriverEvent::RuntimeEventCursorAdvanced(_))
+                            && runtime.replay.is_control_cursor());
                 let background_output_delta = matches!(
                     event,
                     DriverEvent::BackgroundWork(BackgroundWorkEvent::OutputDelta { .. })
@@ -3431,10 +3494,12 @@ impl Waku {
                     // turn a noisy command into UI-thread work.
                 } else if background_event {
                     background_changed = true;
-                } else {
+                } else if !replay_control_event {
                     runtime_changed = true;
                 }
+                let replay_failed_before = runtime.replay.failed();
                 keep_runtime &= self.handle_driver_event(session_id, &mut runtime, event, true, cx);
+                ui_only_changed |= !replay_failed_before && runtime.replay.failed();
                 if !keep_runtime {
                     break;
                 }
@@ -3443,7 +3508,7 @@ impl Waku {
             if keep_runtime {
                 self.runtimes.insert(session_id, runtime);
             }
-            changed |= runtime_changed || background_changed;
+            changed |= runtime_changed || background_changed || ui_only_changed;
             persisted_state_changed |= runtime_changed;
             if self.state.selected_session == Some(session_id)
                 && (runtime_changed || follow_up_remeasure)
@@ -3504,6 +3569,47 @@ mod response_fork_title_tests {
             next_response_fork_title("Plan (2026)", ["Plan (2026)"]),
             "Plan (2026) (2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod renoa_replay_restart_tests {
+    use super::renoa_replay_transaction_required;
+    use crate::model::{AgentSession, ProviderKind, ProviderResumeCursor, RuntimeEventCursor};
+    use uuid::Uuid;
+
+    fn cursor(runtime_id: u128, sequence: u64) -> RuntimeEventCursor {
+        RuntimeEventCursor {
+            runtime_id: Uuid::from_u128(runtime_id),
+            epoch: Uuid::from_u128(2),
+            sequence,
+        }
+    }
+
+    #[test]
+    fn durable_marker_skips_replay_only_for_the_surviving_runtime() {
+        let mut session = AgentSession::new(Uuid::from_u128(1), ProviderKind::Renoa);
+        session.provider_cursor = Some(ProviderResumeCursor::Renoa {
+            session_id: Uuid::from_u128(3).to_string(),
+        });
+        session.renoa_replay_cursor = Some(cursor(4, 10));
+        session.runtime_event_cursor = Some(cursor(4, 11));
+
+        assert!(!renoa_replay_transaction_required(
+            &session,
+            Some(Uuid::from_u128(4))
+        ));
+        assert!(renoa_replay_transaction_required(&session, None));
+        assert!(renoa_replay_transaction_required(
+            &session,
+            Some(Uuid::from_u128(5))
+        ));
+
+        session.runtime_event_cursor = Some(cursor(5, 1));
+        assert!(renoa_replay_transaction_required(
+            &session,
+            Some(Uuid::from_u128(5))
+        ));
     }
 }
 

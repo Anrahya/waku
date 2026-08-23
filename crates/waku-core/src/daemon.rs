@@ -25,9 +25,11 @@ use crate::model::{
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
 use waku_protocol::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
+use waku_protocol::{MAX_WIRE_MESSAGE_BYTES, ResponseOutcome, ServerMessage};
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
+    replay_commits: Mutex<HashMap<(Uuid, Uuid), waku_protocol::replay::ReplayFragmentAssembler>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
     settings: DaemonSettingsStore,
     task_store: StateStore,
@@ -62,6 +64,7 @@ impl WakuBackend {
             .to_owned();
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
+            replay_commits: Mutex::new(HashMap::new()),
             terminals: Mutex::new(HashMap::new()),
             settings,
             task_store,
@@ -349,6 +352,7 @@ impl Backend for WakuBackend {
                         ) {
                             merge_stale_session_metadata(existing, session);
                         } else {
+                            preserve_daemon_replay_marker(existing, &mut session);
                             preserve_daemon_checkpoints(existing, &mut session);
                             *existing = session;
                         }
@@ -380,6 +384,10 @@ impl Backend for WakuBackend {
                     .collect();
                 Ok(ResponsePayload::TaskStateSaved { sessions })
             }
+            Command::CommitRenoaReplay { fragment } => {
+                self.commit_renoa_replay_fragment(session_id, runtime_id, fragment)
+            }
+            Command::ReadRenoaReplayBase => self.read_renoa_replay_base(session_id, runtime_id),
             Command::RemoveSession => {
                 {
                     let mut state = self.task_state.lock();
@@ -564,6 +572,9 @@ impl Backend for WakuBackend {
             Command::Start { options } => {
                 let previous = self.sessions.lock().remove(&session_id);
                 drop(previous);
+                self.replay_commits
+                    .lock()
+                    .retain(|(stored_session, _), _| *stored_session != session_id);
                 let provider = decode_enum(&options.provider)?;
                 let options = DriverStartOptions {
                     binary: options.binary,
@@ -619,6 +630,7 @@ impl Backend for WakuBackend {
                         .flatten()
                 };
                 drop(removed);
+                self.replay_commits.lock().remove(&(session_id, runtime_id));
                 Ok(ResponsePayload::Ack)
             }
             command => {
@@ -647,6 +659,371 @@ impl Backend for WakuBackend {
     }
 }
 
+impl WakuBackend {
+    fn read_renoa_replay_base(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+    ) -> anyhow::Result<ResponsePayload> {
+        if !self
+            .sessions
+            .lock()
+            .get(&session_id)
+            .is_some_and(|(active_runtime, _)| *active_runtime == runtime_id)
+        {
+            bail!("Renoa replay base targeted an inactive runtime");
+        }
+        let mut state = self.task_state.lock();
+        let session = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| anyhow!("Renoa task {session_id} is unavailable"))?;
+        self.task_store
+            .hydrate(session)
+            .context("could not hydrate Renoa task before reading its replay base")?;
+        if session.provider != ProviderKind::Renoa
+            || !matches!(
+                session.provider_cursor,
+                Some(ProviderResumeCursor::Renoa { .. })
+            )
+        {
+            bail!("replay base targeted a task without a Renoa session binding");
+        }
+        let base = waku_protocol::replay::renoa_replay_base(session)
+            .context("could not fingerprint the Renoa replay base")?;
+        let response = ResponsePayload::RenoaReplayBase {
+            base,
+            session: Box::new(session.clone()),
+        };
+        ensure_bounded_replay_response(response, "Renoa replay base")
+    }
+
+    fn commit_renoa_replay_fragment(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        fragment: waku_protocol::replay::ReplayFragment,
+    ) -> anyhow::Result<ResponsePayload> {
+        if !self
+            .sessions
+            .lock()
+            .get(&session_id)
+            .is_some_and(|(active_runtime, _)| *active_runtime == runtime_id)
+        {
+            bail!("Renoa replay fragment targeted an inactive runtime");
+        }
+
+        let key = (session_id, runtime_id);
+        let mut commits = self.replay_commits.lock();
+        let assembled = if fragment.index == 0 {
+            // A desktop restart always redelivers the complete transaction.
+            // Its first fragment replaces an abandoned in-memory prefix; no
+            // durable state or cursor was advanced by that prefix.
+            let mut assembler = waku_protocol::replay::ReplayFragmentAssembler::default();
+            let assembled = assembler
+                .accept(fragment, waku_protocol::SESSION_REPLAY_FRAGMENT_BYTES)
+                .context("invalid Renoa replay-commit transaction")?;
+            if assembled.is_none() {
+                commits.insert(key, assembler);
+            }
+            assembled
+        } else {
+            let assembler = commits
+                .get_mut(&key)
+                .ok_or_else(|| anyhow!("Renoa replay-commit transaction has no first fragment"))?;
+            assembler
+                .accept(fragment, waku_protocol::SESSION_REPLAY_FRAGMENT_BYTES)
+                .context("invalid Renoa replay-commit transaction")?
+        };
+        let Some(assembled) = assembled else {
+            return Ok(ResponsePayload::Ack);
+        };
+        commits.remove(&key);
+        let commit = assembled
+            .decode_commit()
+            .context("invalid Renoa replay-commit payload")?;
+        // Keep the transaction-registry guard until the SQLite commit returns,
+        // so another client cannot publish a competing transaction for the
+        // same runtime between assembly and acknowledgement.
+        self.commit_renoa_replay(session_id, runtime_id, commit)
+    }
+
+    fn commit_renoa_replay(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        commit: waku_protocol::replay::RenoaReplayCommit,
+    ) -> anyhow::Result<ResponsePayload> {
+        // Hold the runtime registry guard through the durable commit. A close
+        // or replacement runtime cannot race a stale reconciliation between
+        // validation and persistence.
+        let sessions = self.sessions.lock();
+        let active = sessions
+            .get(&session_id)
+            .map(|(active_runtime, driver)| (*active_runtime, driver.clone()));
+        let active_runtime = active.as_ref().map(|(runtime, _)| *runtime);
+        if active_runtime != Some(runtime_id) {
+            bail!(
+                "Renoa replay belongs to runtime {runtime_id}, but the active runtime is {}",
+                active_runtime.map_or_else(|| "absent".to_owned(), |id| id.to_string())
+            );
+        }
+        let driver = active
+            .as_ref()
+            .map(|(_, driver)| driver.clone())
+            .ok_or_else(|| anyhow!("Renoa runtime disappeared before replay acknowledgement"))?;
+        if commit.accepted_cursor.runtime_id != runtime_id {
+            bail!(
+                "Renoa replay cursor belongs to runtime {}, not {runtime_id}",
+                commit.accepted_cursor.runtime_id
+            );
+        }
+        validate_replay_projection(&commit)?;
+
+        let mut state = self.task_state.lock();
+        let index = state
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+            .ok_or_else(|| anyhow!("Renoa task {session_id} is unavailable"))?;
+        self.task_store
+            .hydrate(&mut state.sessions[index])
+            .context("could not hydrate Renoa task before replay commit")?;
+        let session = &mut state.sessions[index];
+        if session.provider != ProviderKind::Renoa {
+            bail!("authoritative Renoa replay targeted a non-Renoa task");
+        }
+        if !matches!(
+            session.provider_cursor,
+            Some(ProviderResumeCursor::Renoa { .. })
+        ) {
+            bail!("authoritative Renoa replay targeted a task without a Renoa session binding");
+        }
+
+        if session.runtime_event_cursor == Some(commit.accepted_cursor) {
+            if session.renoa_replay_cursor == Some(commit.accepted_cursor)
+                && self.replay_projection_matches(session, &commit)?
+            {
+                ensure_replay_response_fits(session)?;
+                if !driver.acknowledge_replay() {
+                    bail!("Renoa runtime could not acknowledge its durable replay commit");
+                }
+                return Ok(ResponsePayload::RenoaReplayCommitted {
+                    session: session.clone(),
+                });
+            }
+            bail!("Renoa replay cursor was already committed with different transcript content");
+        }
+        let current_base = waku_protocol::replay::renoa_replay_base(session)?;
+        if current_base.active_tail_fingerprint.is_some()
+            && current_base.active_tail_fingerprint != commit.local_active_tail_fingerprint
+        {
+            bail!("Renoa replay base contains a conflicting active turn");
+        }
+        let exact_base =
+            current_base.projection_fingerprint == commit.expected_projection_fingerprint;
+        let exact_delayed_tail = current_base.settled_projection_fingerprint
+            == commit.expected_settled_projection_fingerprint
+            && current_base.active_tail_fingerprint == commit.local_active_tail_fingerprint;
+        if !exact_base && !exact_delayed_tail {
+            bail!("Renoa replay base transcript changed while reconciliation was in flight");
+        }
+        if session.runtime_event_cursor != commit.expected_cursor {
+            bail!(
+                "Renoa replay base cursor changed from {:?} to {:?}",
+                commit.expected_cursor,
+                session.runtime_event_cursor
+            );
+        }
+
+        // Build and persist a copy. `StateStore::save` commits all session rows
+        // and their cursor in one SQLite transaction; only a successful commit
+        // replaces the daemon's in-memory truth or its dirty markers.
+        let expected_active_tail = commit.reconciled_active_tail_fingerprint;
+        let mut candidate = state.clone();
+        let candidate_session = &mut candidate.sessions[index];
+        candidate_session.messages = commit.messages;
+        candidate_session.transcript_blocks = commit.transcript_blocks;
+        candidate_session.turns = commit.turns;
+        candidate_session.runtime_event_cursor = Some(commit.accepted_cursor);
+        candidate_session.renoa_replay_cursor = Some(commit.accepted_cursor);
+        candidate_session.updated_at = candidate_session.updated_at.max(commit.reconciled_at);
+        if waku_protocol::replay::renoa_replay_base(candidate_session)?.active_tail_fingerprint
+            != expected_active_tail
+        {
+            bail!("Renoa replay replacement changed the accepted active turn");
+        }
+        ensure_replay_response_fits(candidate_session)?;
+        candidate.mark_authoritative_message_replacement(session_id);
+        self.task_store
+            .save(&mut candidate)
+            .context("could not persist authoritative Renoa replay")?;
+        let session = candidate.sessions[index].clone();
+        *state = candidate;
+        if !driver.acknowledge_replay() {
+            bail!("Renoa runtime could not acknowledge its durable replay commit");
+        }
+        Ok(ResponsePayload::RenoaReplayCommitted { session })
+    }
+
+    fn replay_projection_matches(
+        &self,
+        session: &AgentSession,
+        commit: &waku_protocol::replay::RenoaReplayCommit,
+    ) -> anyhow::Result<bool> {
+        let existing_blocks = blocks_without_image_payloads(&session.transcript_blocks);
+        let proposed_blocks = blocks_without_image_payloads(&commit.transcript_blocks);
+        let existing = serde_json::to_vec(&(&session.messages, existing_blocks, &session.turns))?;
+        let proposed = serde_json::to_vec(&(&commit.messages, proposed_blocks, &commit.turns))?;
+        if existing != proposed {
+            return Ok(false);
+        }
+
+        let existing_images = session
+            .transcript_blocks
+            .iter()
+            .flat_map(|block| block.activities.iter())
+            .flat_map(|activity| activity.image_urls.iter());
+        let proposed_images = commit
+            .transcript_blocks
+            .iter()
+            .flat_map(|block| block.activities.iter())
+            .flat_map(|activity| activity.image_urls.iter());
+        for (existing, proposed) in existing_images.zip(proposed_images) {
+            if existing == proposed {
+                continue;
+            }
+            let Some(expected) = decode_data_url_bytes(proposed) else {
+                return Ok(false);
+            };
+            let Some(path) = self.task_store.blobs().path_for(existing) else {
+                return Ok(false);
+            };
+            if std::fs::read(path).ok().as_deref() != Some(expected.as_slice()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn ensure_replay_response_fits(session: &AgentSession) -> anyhow::Result<()> {
+    ensure_bounded_replay_response(
+        ResponsePayload::RenoaReplayCommitted {
+            session: session.clone(),
+        },
+        "Renoa replay acknowledgement",
+    )
+    .map(|_| ())
+}
+
+fn ensure_bounded_replay_response(
+    payload: ResponsePayload,
+    description: &str,
+) -> anyhow::Result<ResponsePayload> {
+    let payload_size = serde_json::to_vec(&payload)
+        .with_context(|| format!("could not serialize the {description}"))?
+        .len();
+    let empty_payload = ResponsePayload::Ack;
+    let envelope = ServerMessage::Response {
+        request_id: Uuid::nil(),
+        outcome: ResponseOutcome::Ok {
+            payload: empty_payload.clone(),
+        },
+    };
+    let envelope_size = serde_json::to_vec(&envelope)?.len();
+    let empty_payload_size = serde_json::to_vec(&empty_payload)?.len();
+    let size = envelope_size - empty_payload_size + payload_size;
+    if size > MAX_WIRE_MESSAGE_BYTES {
+        bail!(
+            "serialized {description} is {size} bytes, exceeding the {MAX_WIRE_MESSAGE_BYTES}-byte wire bound"
+        );
+    }
+    Ok(payload)
+}
+
+fn validate_replay_projection(
+    commit: &waku_protocol::replay::RenoaReplayCommit,
+) -> anyhow::Result<()> {
+    if commit.accepted_cursor.sequence == 0 {
+        bail!("Renoa replay cursor has an invalid zero sequence");
+    }
+    if commit.expected_cursor.is_some_and(|expected| {
+        expected.runtime_id == commit.accepted_cursor.runtime_id
+            && expected.epoch == commit.accepted_cursor.epoch
+            && expected.sequence >= commit.accepted_cursor.sequence
+    }) {
+        bail!("Renoa replay cursor does not advance beyond its base cursor");
+    }
+    if commit
+        .transcript_blocks
+        .iter()
+        .any(|block| block.after_message > commit.messages.len())
+    {
+        bail!("Renoa replay contains a transcript block beyond the message list");
+    }
+    if commit
+        .transcript_blocks
+        .windows(2)
+        .any(|blocks| blocks[0].after_message > blocks[1].after_message)
+    {
+        bail!("Renoa replay contains transcript blocks out of presentation order");
+    }
+    let turn_ids = commit
+        .turns
+        .iter()
+        .map(|turn| turn.id)
+        .collect::<HashSet<_>>();
+    if turn_ids.len() != commit.turns.len() {
+        bail!("Renoa replay contains duplicate turn identities");
+    }
+    let mut message_ids = HashSet::with_capacity(commit.messages.len());
+    if commit.messages.iter().any(|message| {
+        message.streaming
+            || message.role == crate::model::MessageRole::System
+            || !message_ids.insert(message.id)
+            || !message
+                .turn_id
+                .is_some_and(|turn_id| turn_ids.contains(&turn_id))
+    }) {
+        bail!("Renoa replay contains an invalid, duplicate, streaming, or unowned message");
+    }
+    if commit.transcript_blocks.iter().any(|block| {
+        !block
+            .turn_id
+            .is_some_and(|turn_id| turn_ids.contains(&turn_id))
+    }) {
+        bail!("Renoa replay contains an unowned transcript activity block");
+    }
+    Ok(())
+}
+
+fn blocks_without_image_payloads(
+    blocks: &[crate::model::TranscriptBlock],
+) -> Vec<crate::model::TranscriptBlock> {
+    let mut blocks = blocks.to_vec();
+    for block in &mut blocks {
+        for activity in &mut block.activities {
+            for image in &mut activity.image_urls {
+                image.clear();
+            }
+        }
+    }
+    blocks
+}
+
+fn decode_data_url_bytes(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+
+    let (header, encoded) = value.split_once(',')?;
+    let header = header.strip_prefix("data:")?;
+    header.contains(";base64").then_some(())?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+}
+
 fn session_projection_precedes(
     existing: &AgentSession,
     incoming: &AgentSession,
@@ -654,6 +1031,24 @@ fn session_projection_precedes(
 ) -> bool {
     let existing_cursor = existing.runtime_event_cursor;
     let incoming_cursor = incoming.runtime_event_cursor;
+    if existing.provider == ProviderKind::Renoa
+        && existing.renoa_replay_cursor.is_some()
+        && match (existing_cursor, incoming_cursor) {
+            (Some(existing), Some(incoming)) => {
+                existing.runtime_id != incoming.runtime_id
+                    || existing.epoch != incoming.epoch
+                    || incoming.sequence <= existing.sequence
+            }
+            (Some(_), None) => true,
+            _ => false,
+        }
+    {
+        // Once Renoa's replay has been committed, an ordinary client save may
+        // extend that exact runtime projection with a later event cursor, but
+        // it may not replace the same (or an older/different) cursor's
+        // authoritative transcript. Metadata still merges below.
+        return true;
+    }
     if let Some(active_runtime_id) = active_runtime_id {
         let existing_is_active =
             existing_cursor.is_some_and(|cursor| cursor.runtime_id == active_runtime_id);
@@ -722,6 +1117,13 @@ fn preserve_daemon_checkpoints(existing: &AgentSession, incoming: &mut AgentSess
         };
         turn.checkpoint = Some(checkpoint.clone());
     }
+}
+
+/// The authoritative replay marker certifies a daemon-owned SQLite commit.
+/// Ordinary client projections may carry it back but can never create, erase,
+/// or advance it independently of `CommitRenoaReplay`.
+fn preserve_daemon_replay_marker(existing: &AgentSession, incoming: &mut AgentSession) {
+    incoming.renoa_replay_cursor = existing.renoa_replay_cursor;
 }
 
 impl WakuBackend {
@@ -1559,6 +1961,8 @@ fn handle_driver_command(
         | Command::SaveTaskState { .. }
         | Command::RemoveSession
         | Command::HydrateSession { .. }
+        | Command::ReadRenoaReplayBase
+        | Command::CommitRenoaReplay { .. }
         | Command::SearchSessionMessages { .. }
         | Command::LoadComposerDrafts
         | Command::SaveComposerDrafts { .. }
@@ -1596,6 +2000,10 @@ fn decode_enum<T: DeserializeOwned>(value: &str) -> anyhow::Result<T> {
         .with_context(|| format!("invalid protocol enum value {value:?}"))
 }
 
+#[cfg(test)]
+#[path = "daemon/replay_tests.rs"]
+mod replay_tests;
+
 pub fn encode_enum<T: Serialize>(value: T) -> anyhow::Result<String> {
     serde_json::to_value(value)?
         .as_str()
@@ -1618,6 +2026,20 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         DriverEvent::AvailableCommands(commands) => {
             ("availableCommands", serde_json::to_value(commands)?)
         }
+        DriverEvent::SessionReplayFragment {
+            replay_id,
+            index,
+            total,
+            json,
+        } => (
+            "sessionReplay",
+            json!({
+                "replayId": replay_id,
+                "index": index,
+                "total": total,
+                "json": json,
+            }),
+        ),
         DriverEvent::TurnStarted => ("turnStarted", Value::Null),
         DriverEvent::TextDelta(text) => ("textDelta", Value::String(text)),
         DriverEvent::ReasoningDelta(text) => ("reasoningDelta", Value::String(text)),
@@ -1708,6 +2130,15 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "autoTitleUpdated" => DriverEvent::AutoTitleUpdated(serde_json::from_value(payload)?),
         "availableCommands" => DriverEvent::AvailableCommands(serde_json::from_value(payload)?),
         "turnStarted" => DriverEvent::TurnStarted,
+        "sessionReplay" => {
+            let fragment: SessionReplayFragmentWire = serde_json::from_value(payload)?;
+            DriverEvent::SessionReplayFragment {
+                replay_id: fragment.replay_id,
+                index: fragment.index,
+                total: fragment.total,
+                json: fragment.json,
+            }
+        }
         "textDelta" => DriverEvent::TextDelta(serde_json::from_value(payload)?),
         "reasoningDelta" => DriverEvent::ReasoningDelta(serde_json::from_value(payload)?),
         "activity" => {
@@ -1838,6 +2269,15 @@ struct UsageWire {
 struct TurnFinishedWire {
     success: bool,
     summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionReplayFragmentWire {
+    replay_id: Uuid,
+    index: usize,
+    total: usize,
+    json: String,
 }
 
 #[cfg(test)]
@@ -1995,5 +2435,104 @@ mod tests {
             event_from_wire(wire).unwrap(),
             DriverEvent::TextDelta(text) if text == "hello"
         ));
+    }
+
+    #[test]
+    fn wire_event_round_trip_preserves_an_authoritative_replay() {
+        use waku_protocol::replay::{
+            ReplayAssistantMessage, ReplayItem, ReplaySegment, ReplayTool, ReplayUserMessage,
+        };
+
+        let replay_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let user_message_id = Uuid::new_v4();
+        let assistant_message_id = Uuid::new_v4();
+        let mut activity = crate::model::ActivityItem::new(
+            Some("call-7".into()),
+            crate::model::ActivityKind::Command,
+            "run bash",
+            None,
+            true,
+        );
+        activity.arguments = Some("{\"command\":\"ls\"}".to_owned());
+        activity.output = Some("out".to_owned());
+        activity.image_urls = vec!["data:image/png;base64,AAEC".to_owned()];
+
+        let replay = waku_protocol::replay::ProviderReplay {
+            items: vec![
+                ReplayItem::UserMessage(ReplayUserMessage {
+                    message_id: user_message_id,
+                    turn_id,
+                    text: "Fix the login bug".to_owned(),
+                }),
+                ReplayItem::AssistantMessage(ReplayAssistantMessage {
+                    message_id: assistant_message_id,
+                    segments: vec![
+                        ReplaySegment::Reasoning("thinking".to_owned()),
+                        ReplaySegment::Text("Answer".to_owned()),
+                    ],
+                }),
+                ReplayItem::ToolCall(ReplayTool {
+                    call_id: "call-7".to_owned(),
+                    activity: Box::new(activity),
+                }),
+            ],
+        };
+        let fragment = replay
+            .encode_fragments(replay_id, 1024 * 1024)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let wire = event_to_wire(DriverEvent::SessionReplayFragment {
+            replay_id: fragment.replay_id,
+            index: fragment.index,
+            total: fragment.total,
+            json: fragment.json,
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "sessionReplay");
+        let DriverEvent::SessionReplayFragment {
+            replay_id: decoded_id,
+            index,
+            total,
+            json,
+        } = event_from_wire(wire).unwrap()
+        else {
+            panic!("the replay changed variants during its wire round trip");
+        };
+        assert_eq!(decoded_id, replay_id);
+        assert_eq!(index, 0);
+        assert_eq!(total, 1);
+        let decoded: waku_protocol::replay::ProviderReplay = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.items.len(), 3);
+        let Some(ReplayItem::UserMessage(user)) = decoded.items.first() else {
+            panic!("the user row changed variants during its wire round trip");
+        };
+        assert_eq!(user.message_id, user_message_id);
+        assert_eq!(user.turn_id, turn_id);
+        assert_eq!(user.text, "Fix the login bug");
+        let Some(ReplayItem::AssistantMessage(assistant)) = decoded.items.get(1) else {
+            panic!("the assistant row changed variants during its wire round trip");
+        };
+        assert_eq!(
+            assistant.segments,
+            [
+                ReplaySegment::Reasoning("thinking".to_owned()),
+                ReplaySegment::Text("Answer".to_owned())
+            ]
+        );
+        let Some(ReplayItem::ToolCall(tool)) = decoded.items.get(2) else {
+            panic!("the tool row changed variants during its wire round trip");
+        };
+        assert_eq!(tool.call_id, "call-7");
+        assert_eq!(
+            tool.activity.arguments.as_deref(),
+            Some("{\"command\":\"ls\"}")
+        );
+        assert_eq!(tool.activity.output.as_deref(), Some("out"));
+        assert_eq!(
+            tool.activity.image_urls,
+            ["data:image/png;base64,AAEC".to_owned()]
+        );
     }
 }

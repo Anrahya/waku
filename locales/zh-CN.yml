@@ -599,6 +599,8 @@ errors.task_not_loaded: 此任务尚未加载
 errors.task_already_forking: 此任务正在派生
 errors.task_already_rewinding: 此任务正在回退
 errors.no_live_runtime: 此任务没有正在运行的智能体
+errors.renoa_web_replay_unsupported: Web 客户端尚无法打开已恢复的 Renoa 会话。请使用桌面应用，以便 Waku 在发送下一条提示前根据 Renoa 的权威历史进行对账。
+errors.web_unsupported_runtime_event: Web 客户端无法应用运行时事件 %{kind}，已拒绝推进会话游标。
 errors.unexpected_daemon_response: "预期守护进程返回 %{expected}，实际收到 %{actual}"
 errors.daemon_disconnected: Waku 守护进程未连接
 errors.path_outside_workspace: 此路径位于守护进程主机上的当前工作区之外

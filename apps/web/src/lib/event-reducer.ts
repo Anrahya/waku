@@ -8,6 +8,8 @@ import type {
   TranscriptBlock,
   TurnStatus,
 } from '@waku/client'
+import { translate } from './i18n'
+import { renoaWebRuntimeError } from './renoa-web-runtime'
 
 export interface PendingPermission {
   requestId: string
@@ -48,14 +50,57 @@ const defaultClock: ReducerClock = {
   randomUUID: () => crypto.randomUUID(),
 }
 
+const HANDLED_RUNTIME_EVENT_KINDS = new Set([
+  'connected',
+  'agentPresetSelected',
+  'autoTitleUpdated',
+  'availableCommands',
+  'turnStarted',
+  'textDelta',
+  'reasoningDelta',
+  'activity',
+  'richActivity',
+  'permission',
+  'userInputRequested',
+  'usageUpdated',
+  'turnFinished',
+  'error',
+  'processExited',
+  // Applied outside this reducer; the cursor must still advance.
+  'planUsageUpdated',
+  'backgroundWork',
+  'computerUseUpdated',
+  'steerAccepted',
+  'steerRejected',
+])
+
 export function reduceRuntimeEvent(
   current: AgentSession,
   wire: SequencedEvent,
   clock: ReducerClock = defaultClock,
   processExitError: string | null = null,
 ): RuntimeEventResult {
-  const session = clone(current)
   const { kind, payload } = wire.event
+  if (kind === 'sessionReplay') {
+    return {
+      session: current,
+      settled: false,
+      removeRuntime: true,
+      error:
+        renoaWebRuntimeError(current, 'en')
+        ?? translate('en', 'errors.web_unsupported_runtime_event', { kind }),
+    }
+  }
+  if (!HANDLED_RUNTIME_EVENT_KINDS.has(kind)) {
+    return {
+      session: current,
+      settled: false,
+      removeRuntime: true,
+      error: translate('en', 'errors.web_unsupported_runtime_event', { kind }),
+    }
+  }
+
+  const session = clone(current)
   const result: RuntimeEventResult = {
     session,
     settled: false,
@@ -221,8 +266,19 @@ export function reduceRuntimeEvent(
       result.userInput = null
       result.removeRuntime = true
       break
-    default:
+    case 'planUsageUpdated':
+    case 'backgroundWork':
+    case 'computerUseUpdated':
+    case 'steerAccepted':
+    case 'steerRejected':
       break
+    default:
+      return {
+        session: current,
+        settled: false,
+        removeRuntime: true,
+        error: translate('en', 'errors.web_unsupported_runtime_event', { kind }),
+      }
   }
 
   session.updated_at = clock.nowSeconds()

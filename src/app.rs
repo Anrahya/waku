@@ -34,11 +34,13 @@ use crate::model::{
     BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus, Checkpoint, CheckpointStatus,
     ContextUsage, DriverEvent, FavoriteModel, InteractionMode, Message, MessageAttachment,
     MessageRole, PendingPermission, Project, ProviderKind, ProviderModel, ProviderProbe,
-    ProviderResumeCursor, QueuedMessage, ReasoningBlock, RuntimeMode, SessionStatus,
-    SessionWorkspace, TranscriptBlock, TurnStatus, UserInputAnswer, UserInputQuestion,
-    compact_path, unix_time, unix_time_millis,
+    ProviderResumeCursor, QueuedMessage, ReasoningBlock, RuntimeEventCursor, RuntimeMode,
+    SessionStatus, SessionWorkspace, TranscriptBlock, TurnStatus, UserInputAnswer,
+    UserInputQuestion, compact_path, unix_time, unix_time_millis,
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+use waku_protocol::replay::reconcile_replay;
 
 use crate::md::render::{
     Ctx as MarkdownCtx, MarkdownView, Metrics as MarkdownMetrics, Palette as MarkdownPalette,
@@ -582,6 +584,10 @@ struct DriverStartRequest {
 struct PreparedDriver {
     handle: DriverHandle,
     events: Receiver<DriverEvent>,
+    /// Present only when attaching to a runtime that survived in the daemon.
+    /// Starting a replacement process must require Renoa to load and replay
+    /// even if the previous runtime left a committed replay marker.
+    reused_runtime: Option<Uuid>,
 }
 
 struct RemoteTaskStateSnapshot {
@@ -864,13 +870,26 @@ struct NavigationRailVisualState {
     emphasized_turn: Option<Uuid>,
 }
 
+/// Whether a committed provider replay may be applied to a session right now.
+///
+/// Only a Renoa runtime produces authoritative replays, and an unhydrated
+/// skeleton is never mistaken for an empty cache: callers keep the replay
+/// buffered until hydration lands instead of acknowledging it unapplied.
+pub(crate) fn can_apply_session_replay(provider: ProviderKind, detail_loaded: bool) -> bool {
+    provider == ProviderKind::Renoa && detail_loaded
+}
+
 struct SessionRuntime {
+    /// Unique local installation identity. A background replay prepared for a
+    /// superseded runtime may never swap into the replacement.
+    instance_id: Uuid,
     driver: DriverHandle,
     /// Invalidates stale ApplyOptions responses when settings change again or
     /// this runtime is replaced while the RPC is in flight.
     options_generation: u64,
     events: Receiver<DriverEvent>,
     pending_events: VecDeque<DriverEvent>,
+    replay: replay::SessionReplayState,
     /// Presentation metadata for steering messages awaiting the provider's
     /// accepted/rejected acknowledgement, in transport order.
     pending_steers: VecDeque<ComposerSubmission>,
@@ -1573,6 +1592,7 @@ mod drafts;
 mod file_search;
 mod image_preview;
 mod render;
+mod replay;
 mod right_panel;
 mod runtime;
 mod sessions;

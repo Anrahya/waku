@@ -100,8 +100,12 @@ fn connect_remote(
                     }
                 };
                 saw_process_exit |= matches!(&event, DriverEvent::ProcessExited);
-                if forwarding_events.send(event).is_err()
-                    || forwarding_events
+                let forward_cursor = forwards_cursor_after(&event);
+                if forwarding_events.send(event).is_err() {
+                    break;
+                }
+                if forward_cursor
+                    && forwarding_events
                         .send(DriverEvent::RuntimeEventCursorAdvanced(cursor))
                         .is_err()
                 {
@@ -128,6 +132,17 @@ fn connect_remote(
         supports_steer,
         events,
     })))
+}
+
+/// Replay fragments form one cursor transaction: intermediate fragment
+/// cursors must not become durable, because restart must request the complete
+/// replay again until the final fragment is reconciled and persisted.
+fn forwards_cursor_after(event: &DriverEvent) -> bool {
+    !matches!(
+        event,
+        DriverEvent::SessionReplayFragment { index, total, .. }
+            if index.checked_add(1) != Some(*total)
+    )
 }
 
 struct RemoteDriverControl {
@@ -285,5 +300,30 @@ impl DriverControl for RemoteDriverControl {
 impl Drop for RemoteDriverControl {
     fn drop(&mut self) {
         self.client.unsubscribe(self.session_id, self.runtime_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fragment(index: usize, total: usize) -> DriverEvent {
+        DriverEvent::SessionReplayFragment {
+            replay_id: uuid::Uuid::new_v4(),
+            index,
+            total,
+            json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn only_the_complete_replay_transaction_releases_its_cursor() {
+        assert!(!forwards_cursor_after(&fragment(0, 3)));
+        assert!(!forwards_cursor_after(&fragment(1, 3)));
+        assert!(forwards_cursor_after(&fragment(2, 3)));
+        assert!(!forwards_cursor_after(&fragment(0, 0)));
+        assert!(forwards_cursor_after(&DriverEvent::TextDelta(
+            "live".into()
+        )));
     }
 }

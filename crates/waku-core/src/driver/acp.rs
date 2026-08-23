@@ -13,13 +13,15 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId,
-    SessionModeId, SessionModeState, SessionNotification, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, StopReason, TextContent,
+    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, ImageContent,
+    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, MessageId,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse, RequestId,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId, SessionModeId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, StopReason, TextContent, ToolCall as AcpToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, Handled, LineDirection, Responder,
@@ -29,6 +31,10 @@ use anyhow::{Context as _, anyhow};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use waku_protocol::TurnPrompt;
+use waku_protocol::replay::{
+    ProviderReplay, ReplayAssistantMessage, ReplayItem, ReplaySegment, ReplayTool,
+    ReplayUserMessage,
+};
 
 use super::activity;
 use crate::driver::{
@@ -57,10 +63,19 @@ enum CommandMessage {
 
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
+    replay_gate: smol::channel::Sender<ReplayGate>,
+    replay_acknowledged: AtomicBool,
+    replay_cancelled: Arc<AtomicBool>,
     supports_steer: bool,
     mode: RuntimeMode,
     interaction_mode: InteractionMode,
     computer_use: Option<super::support::HeadlessComputerUseRuntime>,
+}
+
+#[derive(Clone, Copy)]
+enum ReplayGate {
+    Committed,
+    Aborted,
 }
 
 /// Per-provider launch details. Everything after process launch is ACP.
@@ -164,6 +179,9 @@ impl AcpDriver {
             stderr_lines.clone(),
         )?;
         let (commands, command_rx) = smol::channel::unbounded();
+        let (replay_gate, replay_gate_rx) = smol::channel::bounded(1);
+        let replay_cancelled = Arc::new(AtomicBool::new(false));
+        let thread_replay_cancelled = replay_cancelled.clone();
         let provider_name = provider.display_name();
         let thread_events = events.clone();
 
@@ -189,6 +207,8 @@ impl AcpDriver {
                     fork_context,
                     grok_title_home,
                     command_rx,
+                    replay_gate_rx,
+                    thread_replay_cancelled,
                     thread_events.clone(),
                 ));
                 if let Err(error) = result {
@@ -203,6 +223,9 @@ impl AcpDriver {
 
         Ok(Self {
             commands,
+            replay_gate,
+            replay_acknowledged: AtomicBool::new(false),
+            replay_cancelled,
             supports_steer: !matches!(provider, ProviderKind::Fx | ProviderKind::Renoa),
             mode,
             interaction_mode,
@@ -346,9 +369,12 @@ async fn run_sdk_connection(
     fork_context: Option<String>,
     grok_title_home: Option<std::path::PathBuf>,
     commands: smol::channel::Receiver<CommandMessage>,
+    replay_gate: smol::channel::Receiver<ReplayGate>,
+    replay_cancelled: Arc<AtomicBool>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
     let suppress_session_updates = Arc::new(AtomicBool::new(false));
+    let renoa_load_capture: Arc<Mutex<Option<RenoaReplayCapture>>> = Arc::new(Mutex::new(None));
     let stream_state = Arc::new(Mutex::new(AcpStreamState::default()));
     let pending_permissions: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
     let pending_user_inputs: PendingAcpUserInputs = Arc::new(Mutex::new(HashMap::new()));
@@ -363,9 +389,12 @@ async fn run_sdk_connection(
             {
                 let events = events.clone();
                 let suppress_session_updates = suppress_session_updates.clone();
+                let renoa_load_capture = renoa_load_capture.clone();
                 let stream_state = stream_state.clone();
                 async move |notification: SessionNotification, _connection| {
-                    if !suppress_session_updates.load(Ordering::Acquire) {
+                    if let Some(capture) = renoa_load_capture.lock().as_mut() {
+                        capture.observe(&notification.update);
+                    } else if !suppress_session_updates.load(Ordering::Acquire) {
                         handle_session_update(
                             provider,
                             notification,
@@ -495,13 +524,14 @@ async fn run_sdk_connection(
                 )
                 .block_task()
                 .await?;
-            let (session_id, modes, config_options) = establish_session(
+            let (session_id, modes, config_options, replay) = establish_session(
                 &connection,
                 provider,
                 &initialize,
                 resume_session_id.as_deref(),
                 &cwd,
                 &suppress_session_updates,
+                &renoa_load_capture,
             )
             .await?;
 
@@ -515,12 +545,44 @@ async fn run_sdk_connection(
                     .await;
             }
             let native_session_id = session_id.to_string();
-            let _ = events.send(DriverEvent::Connected {
+            // The complete replay transaction lands in bounded fragments
+            // before the session marker. Renoa prompt handling remains gated
+            // below until the daemon acknowledges durable reconciliation, and
+            // no individual wire frame grows with the transcript.
+            let replay_events = replay
+                .as_ref()
+                .map(prepare_replay_events)
+                .transpose()
+                .map_err(replay_transport_error)?;
+            if let Some(replay_events) = replay_events {
+                for event in replay_events {
+                    events.send(event).map_err(|_| {
+                        replay_transport_error(ReplayTransportError::ConsumerClosed)
+                    })?;
+                }
+            }
+            let connected = DriverEvent::Connected {
                 provider_cursor: Some(ProviderResumeCursor::from_session_id(
                     provider,
                     native_session_id.clone(),
                 )),
-            });
+            };
+            if replay.is_some() {
+                events
+                    .send(connected)
+                    .map_err(|_| replay_transport_error(ReplayTransportError::ConsumerClosed))?;
+                match replay_gate.recv().await {
+                    Ok(ReplayGate::Committed) if !replay_cancelled.load(Ordering::Acquire) => {}
+                    Ok(ReplayGate::Committed | ReplayGate::Aborted) => return Ok(()),
+                    Err(_) => {
+                        return Err(replay_transport_error(
+                            ReplayTransportError::AcknowledgementClosed,
+                        ));
+                    }
+                }
+            } else {
+                let _ = events.send(connected);
+            }
 
             let mut current_model = model;
             apply_model(
@@ -672,6 +734,94 @@ async fn run_sdk_connection(
         .await
 }
 
+#[derive(Debug)]
+enum ReplayTransportError {
+    Codec(waku_protocol::replay::ReplayCodecError),
+    WireEncode(anyhow::Error),
+    WireSerialization(serde_json::Error),
+    Oversize { size: usize, maximum: usize },
+    ConsumerClosed,
+    AcknowledgementClosed,
+}
+
+impl std::fmt::Display for ReplayTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Codec(error) => write!(formatter, "{error}"),
+            Self::WireSerialization(error) => {
+                write!(formatter, "could not serialize replay wire event: {error}")
+            }
+            Self::WireEncode(error) => write!(formatter, "could not encode replay event: {error}"),
+            Self::Oversize { size, maximum } => write!(
+                formatter,
+                "serialized replay event is {size} bytes, exceeding the {maximum}-byte wire bound"
+            ),
+            Self::ConsumerClosed => write!(formatter, "replay consumer closed before commit"),
+            Self::AcknowledgementClosed => write!(
+                formatter,
+                "replay consumer closed before acknowledging durable persistence"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(error) => Some(error),
+            Self::WireEncode(error) => Some(error.as_ref()),
+            Self::WireSerialization(error) => Some(error),
+            Self::Oversize { .. } | Self::ConsumerClosed | Self::AcknowledgementClosed => None,
+        }
+    }
+}
+
+fn prepare_replay_events(
+    replay: &ProviderReplay,
+) -> Result<Vec<DriverEvent>, ReplayTransportError> {
+    let maximum = waku_protocol::MAX_WIRE_MESSAGE_BYTES;
+    let fragments = replay
+        .encode_fragments(
+            uuid::Uuid::new_v4(),
+            waku_protocol::SESSION_REPLAY_FRAGMENT_BYTES,
+        )
+        .map_err(ReplayTransportError::Codec)?;
+    let mut events = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let event = DriverEvent::SessionReplayFragment {
+            replay_id: fragment.replay_id,
+            index: fragment.index,
+            total: fragment.total,
+            json: fragment.json,
+        };
+        let wire = waku_protocol::event_to_wire(event.clone())
+            .map_err(ReplayTransportError::WireEncode)?;
+        // Measure the complete daemon-to-desktop envelope with maximum-width
+        // sequence metadata, not merely its nested driver event.
+        let message = waku_protocol::ServerMessage::Event(waku_protocol::SequencedEvent {
+            session_id: uuid::Uuid::nil(),
+            runtime_id: uuid::Uuid::nil(),
+            epoch: uuid::Uuid::nil(),
+            sequence: u64::MAX,
+            event: wire,
+        });
+        let size = serde_json::to_vec(&message)
+            .map_err(ReplayTransportError::WireSerialization)?
+            .len();
+        if size > maximum {
+            return Err(ReplayTransportError::Oversize { size, maximum });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn replay_transport_error(error: ReplayTransportError) -> agent_client_protocol::Error {
+    let mut acp_error = agent_client_protocol::Error::internal_error();
+    acp_error.message = format!("could not commit Renoa replay: {error}");
+    acp_error
+}
+
 async fn establish_session(
     connection: &ConnectionTo<Agent>,
     provider: ProviderKind,
@@ -679,17 +829,20 @@ async fn establish_session(
     resume_session_id: Option<&str>,
     cwd: &Path,
     suppress_session_updates: &AtomicBool,
+    renoa_load_capture: &Mutex<Option<RenoaReplayCapture>>,
 ) -> agent_client_protocol::Result<(
     SessionId,
     Option<SessionModeState>,
     Option<Vec<SessionConfigOption>>,
+    Option<ProviderReplay>,
 )> {
     if let Some(existing) = resume_session_id {
-        if initialize
-            .agent_capabilities
-            .session_capabilities
-            .resume
-            .is_some()
+        if provider != ProviderKind::Renoa
+            && initialize
+                .agent_capabilities
+                .session_capabilities
+                .resume
+                .is_some()
             && let Ok(response) = connection
                 .send_request(ResumeSessionRequest::new(existing.to_owned(), cwd))
                 .block_task()
@@ -699,22 +852,50 @@ async fn establish_session(
                 SessionId::new(existing.to_owned()),
                 response.modes,
                 response.config_options,
+                None,
             ));
         }
 
         if initialize.agent_capabilities.load_session {
-            suppress_session_updates.store(true, Ordering::Release);
+            // Renoa replays its complete durable history through ordinary
+            // session updates before the load response. Capture instead of
+            // suppressing, and commit only on success; every other provider
+            // keeps discarding load-time updates.
+            let capture_renoa = provider == ProviderKind::Renoa;
+            if capture_renoa {
+                renoa_load_capture
+                    .lock()
+                    .replace(RenoaReplayCapture::default());
+            } else {
+                suppress_session_updates.store(true, Ordering::Release);
+            }
             let response = connection
                 .send_request(LoadSessionRequest::new(existing.to_owned(), cwd))
                 .block_task()
                 .await;
-            suppress_session_updates.store(false, Ordering::Release);
+            let captured = if capture_renoa {
+                renoa_load_capture.lock().take()
+            } else {
+                suppress_session_updates.store(false, Ordering::Release);
+                None
+            };
             match response {
                 Ok(response) => {
+                    let replay = match captured {
+                        Some(capture) => Some(capture.finalize().map_err(|error| {
+                            let reason = error.to_string();
+                            let mut load_error = agent_client_protocol::Error::internal_error();
+                            load_error.message =
+                                format!("failed to load Renoa session {existing}: {reason}");
+                            load_error
+                        })?),
+                        None => None,
+                    };
                     return Ok((
                         SessionId::new(existing.to_owned()),
                         response.modes,
                         response.config_options,
+                        replay,
                     ));
                 }
                 Err(error) if acp_load_fails_closed(provider) => {
@@ -731,7 +912,12 @@ async fn establish_session(
         .send_request(NewSessionRequest::new(cwd))
         .block_task()
         .await?;
-    Ok((response.session_id, response.modes, response.config_options))
+    Ok((
+        response.session_id,
+        response.modes,
+        response.config_options,
+        None,
+    ))
 }
 
 fn acp_load_fails_closed(provider: ProviderKind) -> bool {
@@ -1814,6 +2000,448 @@ fn fx_context_notice(text: &str) -> bool {
     text.starts_with("[context] ") || text.starts_with("skill discovery warning: ")
 }
 
+/// Captures Renoa's durable-history replay while `session/load` is in flight.
+///
+/// Updates are validated and grouped as they arrive, so the buffer can only
+/// finalize as a complete, well-identified transcript. Known configuration
+/// and status updates carry no transcript semantics and are ignored on
+/// purpose; any other unrecognized kind fails the load instead of silently
+/// truncating history.
+#[derive(Default)]
+struct RenoaReplayCapture {
+    items: Vec<ReplayItem>,
+    error: Option<String>,
+    user_turns: HashMap<uuid::Uuid, uuid::Uuid>,
+    turn_messages: HashMap<uuid::Uuid, uuid::Uuid>,
+    assistant_positions: HashMap<uuid::Uuid, usize>,
+    open_tools: HashMap<String, usize>,
+    current_turn: Option<uuid::Uuid>,
+}
+
+impl RenoaReplayCapture {
+    fn observe(&mut self, update: &SessionUpdate) {
+        if self.error.is_some() {
+            return;
+        }
+        match update {
+            SessionUpdate::UserMessageChunk(chunk) => self.user_chunk(chunk),
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                self.assistant_chunk(chunk, false);
+            }
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                self.assistant_chunk(chunk, true);
+            }
+            SessionUpdate::ToolCall(call) => self.tool_call(call),
+            SessionUpdate::ToolCallUpdate(update) => self.tool_update(update),
+            SessionUpdate::Plan(_)
+            | SessionUpdate::AvailableCommandsUpdate(_)
+            | SessionUpdate::CurrentModeUpdate(_)
+            | SessionUpdate::ConfigOptionUpdate(_)
+            | SessionUpdate::SessionInfoUpdate(_)
+            | SessionUpdate::UsageUpdate(_) => {}
+            _ => self.fail(
+                "the load replay carried an unknown update kind; \
+                 refusing to build a partial transcript",
+            ),
+        }
+    }
+
+    fn user_chunk(&mut self, chunk: &ContentChunk) {
+        let Some(message_id) = self.message_uuid(&chunk.message_id, "user message") else {
+            return;
+        };
+        let turn_id = chunk
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("requestId"))
+            .and_then(Value::as_str)
+            .and_then(|id| uuid::Uuid::parse_str(id).ok());
+        let Some(turn_id) = turn_id else {
+            self.fail("the replayed user message is missing its requestId UUID");
+            return;
+        };
+        let Some(text) = self.chunk_text(chunk, "user") else {
+            return;
+        };
+        if let Some(ReplayItem::UserMessage(user)) = self.items.last_mut()
+            && user.message_id == message_id
+            && user.turn_id == turn_id
+        {
+            user.text.push_str(&text);
+            return;
+        }
+        if !self.open_tools.is_empty() {
+            self.fail(
+                "a new replayed user message arrived before the prior tool lifecycle settled",
+            );
+            return;
+        }
+        if self.assistant_positions.contains_key(&message_id) {
+            self.fail(&format!(
+                "replayed messageId {message_id} changed from assistant to user"
+            ));
+            return;
+        }
+        if let Some(previous_turn) = self.user_turns.insert(message_id, turn_id) {
+            self.fail(&format!(
+                "replayed user message {message_id} resumed after an event boundary (previous request {previous_turn})"
+            ));
+            return;
+        }
+        if let Some(previous_message) = self.turn_messages.insert(turn_id, message_id) {
+            self.fail(&format!(
+                "replayed request {turn_id} maps to user messages {previous_message} and {message_id}"
+            ));
+            return;
+        }
+        self.current_turn = Some(turn_id);
+        self.items.push(ReplayItem::UserMessage(ReplayUserMessage {
+            message_id,
+            turn_id,
+            text,
+        }));
+    }
+
+    fn assistant_chunk(&mut self, chunk: &ContentChunk, reasoning: bool) {
+        if self.current_turn.is_none() {
+            self.fail("a replayed assistant message arrived before any user message");
+            return;
+        }
+        let Some(message_id) = self.message_uuid(&chunk.message_id, "assistant message") else {
+            return;
+        };
+        let Some(text) = self.chunk_text(chunk, "assistant") else {
+            return;
+        };
+        let segment = if reasoning {
+            ReplaySegment::Reasoning(text)
+        } else {
+            ReplaySegment::Text(text)
+        };
+        if let Some(ReplayItem::AssistantMessage(assistant)) = self.items.last_mut()
+            && assistant.message_id == message_id
+        {
+            assistant.segments.push(segment);
+            return;
+        }
+        if self.assistant_positions.contains_key(&message_id) {
+            self.fail(&format!(
+                "replayed assistant message {message_id} resumed after a tool or message boundary"
+            ));
+            return;
+        }
+        if self.user_turns.contains_key(&message_id) {
+            self.fail(&format!(
+                "replayed messageId {message_id} changed from user to assistant"
+            ));
+            return;
+        }
+        self.assistant_positions
+            .insert(message_id, self.items.len());
+        self.items
+            .push(ReplayItem::AssistantMessage(ReplayAssistantMessage {
+                message_id,
+                segments: vec![segment],
+            }));
+    }
+
+    fn tool_call(&mut self, call: &AcpToolCall) {
+        if self.current_turn.is_none() {
+            self.fail("a replayed tool call arrived before any user message");
+            return;
+        }
+        let call_id = call.tool_call_id.0.trim();
+        if call_id.is_empty() {
+            self.fail("the replayed tool call is missing its toolCallId");
+            return;
+        }
+        let complete = matches!(
+            call.status,
+            ToolCallStatus::Completed | ToolCallStatus::Failed
+        );
+        let activity = super::activity::replay_tool_activity(super::activity::ReplayToolActivity {
+            source_id: Some(call_id.to_owned()),
+            kind: renoa_tool_kind(call.kind, &call.title),
+            title: call.title.clone(),
+            arguments: call.raw_input.as_ref(),
+            output: None,
+            raw_output: None,
+            image_source: None,
+            failed: false,
+            complete,
+        });
+        let tool = ReplayTool {
+            call_id: call_id.to_owned(),
+            activity: Box::new(activity),
+        };
+        // Repeating a start updates only the latest still-open lifecycle. Once
+        // settled, the same ACP id in a later model round is a new lifecycle.
+        if let Some(position) = self.open_tools.get(call_id).copied() {
+            self.items[position] = ReplayItem::ToolCall(tool);
+        } else {
+            let position = self.items.len();
+            if !complete {
+                self.open_tools.insert(call_id.to_owned(), position);
+            }
+            self.items.push(ReplayItem::ToolCall(tool));
+        }
+    }
+
+    fn tool_update(&mut self, update: &ToolCallUpdate) {
+        if self.current_turn.is_none() {
+            self.fail("a replayed tool result arrived before any user message");
+            return;
+        }
+        let call_id = update.tool_call_id.0.trim();
+        if call_id.is_empty() {
+            self.fail("the replayed tool result is missing its toolCallId");
+            return;
+        }
+        let failed = update.fields.status == Some(ToolCallStatus::Failed);
+        let terminal = failed || update.fields.status == Some(ToolCallStatus::Completed);
+        if !terminal {
+            self.fail(&format!(
+                "replayed tool update {call_id:?} is non-terminal and cannot represent durable history"
+            ));
+            return;
+        }
+        if let Some(items) = update.fields.content.as_ref()
+            && !self.tool_result_content_is_representable(call_id, items)
+        {
+            return;
+        }
+        let Some(position) = self.open_tools.remove(call_id) else {
+            self.fail(&format!(
+                "replayed tool result {call_id:?} has no still-open tool lifecycle"
+            ));
+            return;
+        };
+        {
+            let content_value = match &update.fields.content {
+                Some(items) if !items.is_empty() => match serde_json::to_value(items) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        self.fail(&format!(
+                            "the replayed tool result {call_id:?} could not be serialized: {error}"
+                        ));
+                        return;
+                    }
+                },
+                _ => None,
+            };
+            let raw_output = update
+                .fields
+                .raw_output
+                .clone()
+                .filter(|value| !value.is_null());
+            let output = content_value.or_else(|| raw_output.clone());
+            let ReplayItem::ToolCall(tool) = &mut self.items[position] else {
+                unreachable!("rposition matched this variant");
+            };
+            if let Some(title) = update
+                .fields
+                .title
+                .clone()
+                .filter(|title| !title.is_empty())
+            {
+                tool.activity.title = title;
+            }
+            // Mirrors the live path for text and arguments. That walk
+            // HashSet-dedups image URLs, so image-only typed content is
+            // overwritten below to keep order and multiplicity.
+            let mut rebuilt =
+                super::activity::replay_tool_activity(super::activity::ReplayToolActivity {
+                    source_id: Some(tool.call_id.clone()),
+                    kind: tool.activity.kind,
+                    title: std::mem::take(&mut tool.activity.title),
+                    arguments: update.fields.raw_input.as_ref(),
+                    output: output.as_ref(),
+                    raw_output: raw_output.as_ref(),
+                    image_source: raw_output.as_ref(),
+                    failed,
+                    complete: true,
+                });
+            // A settled result usually repeats only outputs; keep the input
+            // presentation the start already derived.
+            if update.fields.raw_input.is_none() {
+                rebuilt.arguments = tool.activity.arguments.take();
+                rebuilt.authoritative_arguments = tool.activity.authoritative_arguments.take();
+                rebuilt.display_target = tool.activity.display_target.take();
+                rebuilt.display_description = tool.activity.display_description.take();
+                rebuilt.file_changes = std::mem::take(&mut tool.activity.file_changes);
+            }
+            if let Some(urls) = update
+                .fields
+                .content
+                .as_deref()
+                .and_then(typed_replay_image_urls)
+            {
+                rebuilt = rebuilt.with_image_urls(urls);
+            }
+            *tool.activity = rebuilt;
+        }
+    }
+
+    /// Waku's activity row stores text and images separately. Mixed or
+    /// otherwise unrepresentable ordered content is rejected before any
+    /// replay fragment is committed so the cache and cursor stay untouched.
+    fn tool_result_content_is_representable(
+        &mut self,
+        call_id: &str,
+        items: &[ToolCallContent],
+    ) -> bool {
+        let mut saw_text = false;
+        let mut saw_image = false;
+        for item in items {
+            match item {
+                ToolCallContent::Content(content) => match &content.content {
+                    ContentBlock::Text(_) => saw_text = true,
+                    ContentBlock::Image(_) => saw_image = true,
+                    ContentBlock::Audio(_) => {
+                        self.fail(&unsupported_tool_result(call_id, "audio"));
+                        return false;
+                    }
+                    ContentBlock::Resource(_) => {
+                        self.fail(&unsupported_tool_result(call_id, "an embedded resource"));
+                        return false;
+                    }
+                    ContentBlock::ResourceLink(_) => {
+                        self.fail(&unsupported_tool_result(call_id, "a resource link"));
+                        return false;
+                    }
+                    _ => {
+                        self.fail(&unsupported_tool_result(
+                            call_id,
+                            "an unknown content block",
+                        ));
+                        return false;
+                    }
+                },
+                ToolCallContent::Diff(_) => {
+                    self.fail(&unsupported_tool_result(call_id, "a diff"));
+                    return false;
+                }
+                ToolCallContent::Terminal(_) => {
+                    self.fail(&unsupported_tool_result(call_id, "a terminal"));
+                    return false;
+                }
+                _ => {
+                    self.fail(&unsupported_tool_result(
+                        call_id,
+                        "an unknown tool-result kind",
+                    ));
+                    return false;
+                }
+            }
+            if saw_text && saw_image {
+                self.fail(&format!(
+                    "the replayed tool result {call_id:?} mixes text and image blocks; \
+                     Waku cannot represent that ordered content losslessly"
+                ));
+                return false;
+            }
+        }
+        true
+    }
+
+    fn message_uuid(&mut self, id: &Option<MessageId>, what: &str) -> Option<uuid::Uuid> {
+        let Some(raw) = id.as_ref().map(|id| id.0.to_string()) else {
+            self.fail(&format!("the replayed {what} is missing its messageId"));
+            return None;
+        };
+        match uuid::Uuid::parse_str(&raw) {
+            Ok(uuid) => Some(uuid),
+            Err(_) => {
+                self.fail(&format!(
+                    "the replayed {what} carries a non-UUID messageId {raw:?}"
+                ));
+                None
+            }
+        }
+    }
+
+    fn chunk_text(&mut self, chunk: &ContentChunk, what: &str) -> Option<String> {
+        match &chunk.content {
+            ContentBlock::Text(text) => (!text.text.is_empty()).then(|| text.text.clone()),
+            _ => {
+                self.fail(&format!(
+                    "the replayed {what} chunk carries unsupported content; \
+                     only text projects into Waku's cache"
+                ));
+                None
+            }
+        }
+    }
+
+    fn fail(&mut self, reason: &str) {
+        if self.error.is_none() {
+            self.error = Some(reason.to_owned());
+        }
+    }
+
+    fn finalize(self) -> anyhow::Result<ProviderReplay> {
+        if let Some(error) = self.error {
+            anyhow::bail!("{error}");
+        }
+        let replay = ProviderReplay { items: self.items };
+        replay.validate()?;
+        Ok(replay)
+    }
+}
+
+fn unsupported_tool_result(call_id: &str, what: &str) -> String {
+    format!(
+        "the replayed tool result {call_id:?} carries unsupported content ({what}); \
+         Waku cannot represent that ordered content losslessly"
+    )
+}
+
+/// Ordered image URLs from an image-only typed content array. Duplicate
+/// payloads stay as separate entries; HashSet collection of the JSON form
+/// must not replace this list.
+fn typed_replay_image_urls(items: &[ToolCallContent]) -> Option<Vec<String>> {
+    let mut urls = Vec::new();
+    for item in items {
+        let ToolCallContent::Content(content) = item else {
+            return None;
+        };
+        match &content.content {
+            ContentBlock::Image(image) => urls.push(replay_image_url(image)),
+            ContentBlock::Text(_) => return None,
+            _ => return None,
+        }
+    }
+    (!urls.is_empty()).then_some(urls)
+}
+
+fn replay_image_url(image: &ImageContent) -> String {
+    image
+        .uri
+        .as_deref()
+        .filter(|uri| !uri.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("data:{};base64,{}", image.mime_type, image.data))
+}
+
+fn renoa_tool_kind(kind: ToolKind, title: &str) -> ActivityKind {
+    let mapped = match kind {
+        ToolKind::Read => ActivityKind::FileRead,
+        ToolKind::Edit | ToolKind::Delete | ToolKind::Move => ActivityKind::FileChange,
+        ToolKind::Search | ToolKind::Fetch => ActivityKind::Search,
+        ToolKind::Execute => ActivityKind::Command,
+        ToolKind::Think => ActivityKind::Reasoning,
+        ToolKind::SwitchMode | ToolKind::Other => ActivityKind::Tool,
+        _ => ActivityKind::Tool,
+    };
+    if matches!(mapped, ActivityKind::Search | ActivityKind::Tool) {
+        let named = ActivityKind::from_tool_name(title);
+        if named != ActivityKind::Tool {
+            return named;
+        }
+    }
+    mapped
+}
+
 #[derive(Default)]
 struct AcpStreamState {
     tools: HashMap<String, (ActivityKind, String)>,
@@ -1924,6 +2552,21 @@ impl DriverControl for AcpDriver {
         let _ = self.commands.try_send(CommandMessage::Prompt(turn));
     }
 
+    fn acknowledge_replay(&self) -> bool {
+        if self.replay_cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.replay_acknowledged.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        if self.replay_gate.try_send(ReplayGate::Committed).is_ok() {
+            true
+        } else {
+            self.replay_acknowledged.store(false, Ordering::Release);
+            false
+        }
+    }
+
     fn supports_steer(&self) -> bool {
         self.supports_steer
     }
@@ -1933,6 +2576,8 @@ impl DriverControl for AcpDriver {
     }
 
     fn cancel(&self) {
+        self.replay_cancelled.store(true, Ordering::Release);
+        let _ = self.replay_gate.try_send(ReplayGate::Aborted);
         let _ = self.commands.try_send(CommandMessage::Cancel);
     }
 
@@ -1975,6 +2620,8 @@ impl DriverControl for AcpDriver {
 impl Drop for AcpDriver {
     fn drop(&mut self) {
         self.cancel_computer_use();
+        self.replay_cancelled.store(true, Ordering::Release);
+        let _ = self.replay_gate.try_send(ReplayGate::Aborted);
         let _ = self.commands.try_send(CommandMessage::Shutdown);
     }
 }
@@ -1983,7 +2630,7 @@ impl Drop for AcpDriver {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        SessionConfigSelectOption, SessionMode, SessionModeState, ToolCallUpdate,
+        SessionConfigSelectOption, SessionMode, SessionModeState, ToolCallContent, ToolCallUpdate,
         ToolCallUpdateFields,
     };
 
@@ -2040,14 +2687,57 @@ fn main() {
         };
         let method = json_string_field(line, "method").unwrap_or_default();
         let reply = match method.as_str() {
-            "initialize" => format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{\"loadSession\":true}},\"agentInfo\":{{\"name\":\"fake-acp\",\"version\":\"0\"}}}}}}"
-            ),
+            "initialize" => {
+                let resume = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|dir| dir.join("advertise-resume")))
+                    .is_some_and(|marker| marker.exists());
+                let resume_capability = if resume { "\"resume\":{}" } else { "" };
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{\"loadSession\":true,\"sessionCapabilities\":{{{resume_capability}}}}},\"agentInfo\":{{\"name\":\"fake-acp\",\"version\":\"0\"}}}}}}"
+                )
+            }
             "session/new" => format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"sessionId\":\"new-session\"}}}}"
             ),
-            "session/load" => format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32001,\"message\":\"session missing\"}}}}"
+            "session/load" => {
+                // A scripted history is replayed as ordinary session/update
+                // notifications before the response, mirroring Renoa's
+                // durable replay. Without a success marker beside the agent
+                // binary the load fails, which exercises partial replays.
+                let mut history: Option<String> = None;
+                let mut ok = false;
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(dir) = exe.parent() {
+                        history = std::fs::read_to_string(dir.join("acp-load-history.jsonl")).ok();
+                        ok = dir.join("acp-load-ok").exists();
+                    }
+                }
+                match history {
+                    Some(history) => {
+                        for line in history.lines() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            stdout.write_all(line.as_bytes()).expect("stdout");
+                            stdout.write_all(b"\n").expect("stdout");
+                        }
+                        stdout.flush().expect("stdout");
+                        if ok {
+                            format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}")
+                        } else {
+                            format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32001,\"message\":\"session missing\"}}}}"
+                            )
+                        }
+                    }
+                    None => format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32001,\"message\":\"session missing\"}}}}"
+                    ),
+                }
+            }
+            "session/resume" => format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}"
             ),
             "session/prompt" => format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"stopReason\":\"end_turn\"}}}}"
@@ -2196,6 +2886,32 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             panic!("timed out waiting for {method}");
+        }
+
+        /// Stages notifications the agent emits as its durable replay before
+        /// answering `session/load`.
+        fn stage_load_history(&self, notifications: &[Value]) {
+            let body = notifications
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(
+                self._root.path().join("acp-load-history.jsonl"),
+                body + "\n",
+            )
+            .expect("stage fake ACP load history");
+        }
+
+        /// Makes the staged `session/load` succeed after emitting the history.
+        fn stage_load_success(&self) {
+            std::fs::write(self._root.path().join("acp-load-ok"), b"")
+                .expect("stage fake ACP load success");
+        }
+
+        fn advertise_resume(&self) {
+            std::fs::write(self._root.path().join("advertise-resume"), b"")
+                .expect("advertise resume capability");
         }
     }
 
@@ -2619,10 +3335,1002 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     }
 
     #[test]
+    fn renoa_uses_load_even_when_resume_is_advertised() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        fixture.advertise_resume();
+        fixture.stage_load_history(&[]);
+        fixture.stage_load_success();
+        let _driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+        let items = wait_for_renoa_replay(&fixture);
+        assert!(items.is_empty());
+        wait_for_renoa_connected(&fixture.event_rx);
+        assert_eq!(fixture.methods(), ["initialize", "session/load"]);
+    }
+
+    #[test]
+    fn a_renoa_user_image_chunk_fails_the_load_atomically() {
+        use agent_client_protocol::schema::v1::ImageContent;
+
+        let mut capture = RenoaReplayCapture::default();
+        let mut meta = Map::new();
+        meta.insert(
+            "requestId".into(),
+            Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+        capture.observe(&SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Image(ImageContent::new("AAEC", "image/png")))
+                .message_id(MessageId::from(uuid::Uuid::new_v4().to_string()))
+                .meta(meta),
+        ));
+
+        let error = capture
+            .finalize()
+            .expect_err("replayed user images cannot project into the cache");
+        assert!(error.to_string().contains("unsupported content"));
+    }
+
+    fn observe_completed_tool(
+        capture: &mut RenoaReplayCapture,
+        call_id: &'static str,
+        content: Vec<ToolCallContent>,
+    ) {
+        let turn = uuid::Uuid::new_v4();
+        let mut meta = Map::new();
+        meta.insert("requestId".into(), Value::String(turn.to_string()));
+        capture.observe(&SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("prompt")))
+                .message_id(MessageId::from(uuid::Uuid::new_v4().to_string()))
+                .meta(meta),
+        ));
+        capture.observe(&SessionUpdate::ToolCall(
+            AcpToolCall::new(call_id, "run")
+                .kind(ToolKind::Execute)
+                .status(ToolCallStatus::InProgress),
+        ));
+        capture.observe(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            call_id,
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(content),
+        )));
+    }
+
+    #[test]
+    fn mixed_text_and_image_tool_results_fail_before_any_replay_commit() {
+        use agent_client_protocol::schema::v1::ImageContent;
+
+        let mut capture = RenoaReplayCapture::default();
+        observe_completed_tool(
+            &mut capture,
+            "mixed",
+            vec![
+                ToolCallContent::from(ContentBlock::Text(TextContent::new("A"))),
+                ToolCallContent::from(ContentBlock::Image(ImageContent::new("AAEC", "image/png"))),
+                ToolCallContent::from(ContentBlock::Text(TextContent::new("B"))),
+            ],
+        );
+
+        let error = capture
+            .finalize()
+            .expect_err("mixed ordered tool content cannot be stored losslessly");
+        assert!(
+            error.to_string().contains("mixes text and image"),
+            "the error must name the mixed shape: {error}"
+        );
+    }
+
+    #[test]
+    fn text_only_and_image_only_tool_results_still_project() {
+        use agent_client_protocol::schema::v1::ImageContent;
+
+        let mut text_capture = RenoaReplayCapture::default();
+        observe_completed_tool(
+            &mut text_capture,
+            "text-only",
+            vec![ToolCallContent::from(ContentBlock::Text(TextContent::new(
+                "stdout",
+            )))],
+        );
+        let text_replay = text_capture
+            .finalize()
+            .expect("text-only tool results work");
+        let ReplayItem::ToolCall(text_tool) = &text_replay.items[1] else {
+            panic!("text tool is retained");
+        };
+        assert!(
+            text_tool
+                .activity
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("stdout"))
+        );
+        assert!(text_tool.activity.image_urls.is_empty());
+
+        let mut image_capture = RenoaReplayCapture::default();
+        observe_completed_tool(
+            &mut image_capture,
+            "image-only",
+            vec![ToolCallContent::from(ContentBlock::Image(
+                ImageContent::new("AAEC", "image/png"),
+            ))],
+        );
+        let image_replay = image_capture
+            .finalize()
+            .expect("image-only tool results work");
+        let ReplayItem::ToolCall(image_tool) = &image_replay.items[1] else {
+            panic!("image tool is retained");
+        };
+        assert_eq!(
+            image_tool.activity.image_urls,
+            vec!["data:image/png;base64,AAEC".to_owned()]
+        );
+    }
+
+    #[test]
+    fn image_only_tool_results_preserve_order_and_multiplicity() {
+        let png = |data: &str| ImageContent::new(data, "image/png");
+        let image = |content: ImageContent| ToolCallContent::from(ContentBlock::Image(content));
+
+        let mut repeated = RenoaReplayCapture::default();
+        observe_completed_tool(
+            &mut repeated,
+            "repeat",
+            vec![image(png("AAEC")), image(png("AAEC"))],
+        );
+        let repeated_replay = repeated
+            .finalize()
+            .expect("repeated images are representable");
+        let ReplayItem::ToolCall(repeated_tool) = &repeated_replay.items[1] else {
+            panic!("repeated image tool is retained");
+        };
+        assert_eq!(
+            repeated_tool.activity.image_urls,
+            vec![
+                "data:image/png;base64,AAEC".to_owned(),
+                "data:image/png;base64,AAEC".to_owned(),
+            ],
+            "duplicate payloads must not collapse"
+        );
+
+        let mut interleaved = RenoaReplayCapture::default();
+        observe_completed_tool(
+            &mut interleaved,
+            "interleaved",
+            vec![
+                image(png("AAEC")),
+                image(png("").uri("https://example.com/b.png")),
+                image(png("AAEC")),
+            ],
+        );
+        let interleaved_replay = interleaved
+            .finalize()
+            .expect("interleaved images are representable");
+        let ReplayItem::ToolCall(interleaved_tool) = &interleaved_replay.items[1] else {
+            panic!("interleaved image tool is retained");
+        };
+        assert_eq!(
+            interleaved_tool.activity.image_urls,
+            vec![
+                "data:image/png;base64,AAEC".to_owned(),
+                "https://example.com/b.png".to_owned(),
+                "data:image/png;base64,AAEC".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_renoa_message_id_cannot_change_semantic_roles() {
+        let mut capture = RenoaReplayCapture::default();
+        let message_id = uuid::Uuid::new_v4();
+        let mut meta = Map::new();
+        meta.insert(
+            "requestId".into(),
+            Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+        capture.observe(&SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("prompt")))
+                .message_id(MessageId::from(message_id.to_string()))
+                .meta(meta),
+        ));
+        capture.observe(&SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("answer")))
+                .message_id(MessageId::from(message_id.to_string())),
+        ));
+
+        let error = capture
+            .finalize()
+            .expect_err("messageId role changes are ambiguous");
+        assert!(error.to_string().contains("changed from user to assistant"));
+    }
+
+    #[test]
+    fn renoa_tool_call_ids_may_be_reused_across_turns() {
+        let mut capture = RenoaReplayCapture::default();
+        for turn in [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()] {
+            let mut meta = Map::new();
+            meta.insert("requestId".into(), Value::String(turn.to_string()));
+            capture.observe(&SessionUpdate::UserMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new("prompt")))
+                    .message_id(MessageId::from(uuid::Uuid::new_v4().to_string()))
+                    .meta(meta),
+            ));
+            capture.observe(&SessionUpdate::ToolCall(
+                AcpToolCall::new("call-1", "run")
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::InProgress),
+            ));
+            capture.observe(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "call-1",
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .content(vec![ToolCallContent::from(ContentBlock::Text(
+                        TextContent::new(turn.to_string()),
+                    ))]),
+            )));
+        }
+
+        let replay = capture.finalize().expect("both turns are well formed");
+        assert_eq!(replay.items.len(), 4);
+        let outputs = replay
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ReplayItem::ToolCall(tool) => tool.activity.output.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs.len(),
+            2,
+            "a reused call id must not overwrite the earlier turn's tool"
+        );
+    }
+
+    #[test]
+    fn renoa_tool_call_ids_may_be_reused_in_later_rounds_of_one_turn() {
+        let mut capture = RenoaReplayCapture::default();
+        let turn = uuid::Uuid::new_v4();
+        let mut meta = Map::new();
+        meta.insert("requestId".into(), Value::String(turn.to_string()));
+        capture.observe(&SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("prompt")))
+                .message_id(MessageId::from(uuid::Uuid::new_v4().to_string()))
+                .meta(meta),
+        ));
+
+        for (round, output) in [(1, "first"), (2, "second")] {
+            capture.observe(&SessionUpdate::ToolCall(
+                AcpToolCall::new("call-reused", format!("run {round}"))
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::InProgress),
+            ));
+            capture.observe(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "call-reused",
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .content(vec![ToolCallContent::from(ContentBlock::Text(
+                        TextContent::new(output),
+                    ))]),
+            )));
+            if round == 1 {
+                capture.observe(&SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new("continue")))
+                        .message_id(MessageId::from(uuid::Uuid::new_v4().to_string())),
+                ));
+            }
+        }
+
+        let replay = capture.finalize().expect("both tool rounds are valid");
+        let tools = replay
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ReplayItem::ToolCall(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].call_id, "call-reused");
+        assert_eq!(tools[1].call_id, "call-reused");
+        assert_ne!(tools[0].activity.output, tools[1].activity.output);
+    }
+
+    #[test]
+    fn renoa_replay_keeps_complete_tool_output_beyond_the_live_preview_cap() {
+        let mut capture = RenoaReplayCapture::default();
+        let turn = uuid::Uuid::new_v4();
+        let mut meta = Map::new();
+        meta.insert("requestId".into(), Value::String(turn.to_string()));
+        capture.observe(&SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("prompt")))
+                .message_id(MessageId::from(uuid::Uuid::new_v4().to_string()))
+                .meta(meta),
+        ));
+        capture.observe(&SessionUpdate::ToolCall(
+            AcpToolCall::new("large-output", "run")
+                .kind(ToolKind::Execute)
+                .raw_input(json!({"payload": "y".repeat(40_000)}))
+                .status(ToolCallStatus::InProgress),
+        ));
+        let output = format!("{}END", "x".repeat(40_000));
+        let raw_output = json!({"diagnostic": format!("{}RAW-END", "z".repeat(40_000))});
+        capture.observe(&SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "large-output",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![ToolCallContent::from(ContentBlock::Text(
+                    TextContent::new(output),
+                ))])
+                .raw_output(raw_output),
+        )));
+
+        let replay = capture.finalize().expect("large output is supported");
+        let ReplayItem::ToolCall(tool) = &replay.items[1] else {
+            panic!("tool result is retained");
+        };
+        let durable = tool.activity.durable_output().expect("durable output");
+        assert!(durable.len() > 40_000);
+        assert!(durable.contains("END"));
+        assert!(!durable.contains("truncated"));
+        let durable_raw = tool
+            .activity
+            .durable_raw_output()
+            .expect("durable raw output");
+        assert!(durable_raw.len() > 40_000);
+        assert!(durable_raw.contains("RAW-END"));
+        assert!(!durable_raw.contains("truncated"));
+        assert!(
+            tool.activity
+                .output
+                .as_ref()
+                .is_some_and(|preview| preview.chars().count() < durable.chars().count()),
+            "the disclosure preview stays bounded without truncating durable output"
+        );
+        let durable_arguments = tool
+            .activity
+            .durable_arguments()
+            .expect("durable tool input");
+        assert!(durable_arguments.len() > 40_000);
+        assert!(
+            tool.activity
+                .arguments
+                .as_ref()
+                .is_some_and(|preview| preview.chars().count() < durable_arguments.chars().count())
+        );
+    }
+
+    #[test]
+    fn renoa_unsupported_assistant_order_fails_before_replay_is_emitted() {
+        let mut capture = RenoaReplayCapture::default();
+        let turn = uuid::Uuid::new_v4();
+        let mut meta = Map::new();
+        meta.insert("requestId".into(), Value::String(turn.to_string()));
+        capture.observe(&SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("prompt")))
+                .message_id(MessageId::from(uuid::Uuid::new_v4().to_string()))
+                .meta(meta),
+        ));
+        let assistant = MessageId::from(uuid::Uuid::new_v4().to_string());
+        for (reasoning, text) in [(true, "think"), (false, "answer"), (true, "more")] {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+                .message_id(assistant.clone());
+            if reasoning {
+                capture.observe(&SessionUpdate::AgentThoughtChunk(chunk));
+            } else {
+                capture.observe(&SessionUpdate::AgentMessageChunk(chunk));
+            }
+        }
+
+        let error = capture
+            .finalize()
+            .expect_err("alternating assistant content is not representable losslessly");
+        assert!(error.to_string().contains("alternates text and reasoning"));
+    }
+
+    #[test]
+    fn renoa_malformed_child_replay_emits_neither_replay_nor_connected() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        fixture.stage_load_history(&[renoa_notification(
+            durable_session,
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "missing identity"},
+                "messageId": uuid::Uuid::new_v4().to_string(),
+            }),
+        )]);
+        fixture.stage_load_success();
+        let _driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+
+        let error = wait_for_renoa_error(&fixture.event_rx);
+        assert!(error.contains("missing its requestId UUID"));
+        assert!(fixture.event_rx.try_iter().all(|event| !matches!(
+            event,
+            DriverEvent::SessionReplayFragment { .. } | DriverEvent::Connected { .. }
+        )));
+    }
+
+    #[test]
+    fn mixed_tool_result_content_emits_neither_replay_nor_connected() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        fixture.stage_load_history(&[
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "prompt"},
+                    "messageId": uuid::Uuid::new_v4().to_string(),
+                    "_meta": {"requestId": uuid::Uuid::new_v4().to_string()},
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "mixed",
+                    "title": "run",
+                    "kind": "execute",
+                    "status": "in_progress",
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "mixed",
+                    "status": "completed",
+                    "content": [
+                        {"type": "content", "content": {"type": "text", "text": "A"}},
+                        {
+                            "type": "content",
+                            "content": {"type": "image", "data": "AAEC", "mimeType": "image/png"}
+                        },
+                        {"type": "content", "content": {"type": "text", "text": "B"}}
+                    ],
+                }),
+            ),
+        ]);
+        fixture.stage_load_success();
+        let _driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+
+        let error = wait_for_renoa_error(&fixture.event_rx);
+        assert!(
+            error.contains("mixes text and image"),
+            "the load must fail closed: {error}"
+        );
+        assert!(fixture.event_rx.try_iter().all(|event| !matches!(
+            event,
+            DriverEvent::SessionReplayFragment { .. } | DriverEvent::Connected { .. }
+        )));
+    }
+
+    fn renoa_notification(session_id: &str, update: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": update,
+            },
+        })
+    }
+
+    /// Collects and decodes one committed replay transaction.
+    fn wait_for_renoa_replay(fixture: &FakeAcpAgent) -> Vec<ReplayItem> {
+        let mut assembler = waku_protocol::replay::ReplayFragmentAssembler::default();
+        loop {
+            match fixture
+                .event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("Renoa should commit its replay")
+            {
+                DriverEvent::SessionReplayFragment {
+                    replay_id,
+                    index,
+                    total,
+                    json,
+                } => {
+                    let assembled = assembler
+                        .accept(
+                            waku_protocol::replay::ReplayFragment {
+                                replay_id,
+                                index,
+                                total,
+                                json,
+                            },
+                            waku_protocol::SESSION_REPLAY_FRAGMENT_BYTES,
+                        )
+                        .expect("replay fragments are contiguous and bounded");
+                    if let Some(assembled) = assembled {
+                        return assembled.decode().expect("replay JSON decodes").items;
+                    }
+                }
+                other => panic!("unexpected event before the committed replay: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn renoa_replay_commits_the_durable_history_before_connected() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        let turn_id = uuid::Uuid::new_v4();
+        let user_message_id = uuid::Uuid::new_v4();
+        let assistant_id = uuid::Uuid::new_v4();
+        let second_assistant_id = uuid::Uuid::new_v4();
+        fixture.stage_load_history(&[
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "First"},
+                    "messageId": user_message_id.to_string(),
+                    "_meta": {"requestId": turn_id.to_string()},
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "thinking"},
+                    "messageId": assistant_id.to_string(),
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Reply."},
+                    "messageId": assistant_id.to_string(),
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "run bash",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"command": "ls"},
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "completed",
+                    "content": [
+                        {"type": "content", "content": {"type": "text", "text": "out"}}
+                    ],
+                    "rawOutput": {"exit": 0},
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-2",
+                    "title": "render chart",
+                    "kind": "other",
+                    "status": "in_progress",
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-2",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "content",
+                            "content": {"type": "image", "data": "AAEC", "mimeType": "image/png"}
+                        }
+                    ],
+                }),
+            ),
+            renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Second."},
+                    "messageId": second_assistant_id.to_string(),
+                }),
+            ),
+        ]);
+        fixture.stage_load_success();
+
+        let _driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+
+        // The very first events are the committed replay fragments; live deltas
+        // never carry the load transcript.
+        let items = wait_for_renoa_replay(&fixture);
+        assert_eq!(items.len(), 5);
+        let Some(ReplayItem::UserMessage(user)) = items.first() else {
+            panic!("the replay starts with the durable user message");
+        };
+        assert_eq!(user.message_id, user_message_id);
+        assert_eq!(user.turn_id, turn_id);
+        assert_eq!(user.text, "First");
+        let Some(ReplayItem::AssistantMessage(assistant)) = items.get(1) else {
+            panic!("the assistant reply follows");
+        };
+        assert_eq!(assistant.message_id, assistant_id);
+        assert_eq!(
+            assistant.segments,
+            vec![
+                ReplaySegment::Reasoning("thinking".to_owned()),
+                ReplaySegment::Text("Reply.".to_owned()),
+            ]
+        );
+        let Some(ReplayItem::ToolCall(first_tool)) = items.get(2) else {
+            panic!("the settled tool work follows");
+        };
+        assert_eq!(first_tool.call_id, "call-1");
+        assert_eq!(first_tool.activity.kind, ActivityKind::Command);
+        assert!(first_tool.activity.complete);
+        assert!(
+            first_tool
+                .activity
+                .arguments
+                .as_deref()
+                .is_some_and(|arguments| arguments.contains("ls")),
+            "the raw input survives: {:?}",
+            first_tool.activity.arguments
+        );
+        assert!(
+            first_tool
+                .activity
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("out")),
+            "the tool output survives: {:?} and content was {:?}",
+            first_tool.activity.output,
+            first_tool.activity.arguments
+        );
+        let Some(ReplayItem::ToolCall(image_tool)) = items.get(3) else {
+            panic!("the image tool follows");
+        };
+        assert_eq!(image_tool.call_id, "call-2");
+        assert_eq!(
+            image_tool.activity.image_urls,
+            vec!["data:image/png;base64,AAEC".to_owned()],
+            "replayed images round-trip losslessly"
+        );
+        let Some(ReplayItem::AssistantMessage(second)) = items.get(4) else {
+            panic!("the final assistant message closes the replay");
+        };
+        assert_eq!(second.message_id, second_assistant_id);
+        assert_eq!(
+            second.segments,
+            vec![ReplaySegment::Text("Second.".to_owned())]
+        );
+
+        // Connected arrives only after the committed replay.
+        wait_for_renoa_connected(&fixture.event_rx);
+        let methods = fixture.methods();
+        assert!(methods.contains(&"initialize".to_owned()));
+        assert!(methods.contains(&"session/load".to_owned()));
+        assert!(
+            !methods.contains(&"session/new".to_owned()),
+            "a successful Renoa load must not create a replacement session"
+        );
+    }
+
+    #[test]
+    fn renoa_prompt_waits_for_the_durable_replay_acknowledgement() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        fixture.stage_load_history(&[]);
+        fixture.stage_load_success();
+        let driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+        driver.prompt(TurnPrompt {
+            id: uuid::Uuid::from_u128(90),
+            prompt: "must wait".into(),
+        });
+
+        assert!(wait_for_renoa_replay(&fixture).is_empty());
+        wait_for_renoa_connected(&fixture.event_rx);
+        assert!(
+            !fixture
+                .methods()
+                .iter()
+                .any(|method| method == "session/prompt"),
+            "the queued prompt crossed before durable replay acknowledgement"
+        );
+
+        assert!(driver.acknowledge_replay());
+        loop {
+            match fixture
+                .event_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the acknowledged prompt should settle")
+            {
+                DriverEvent::TurnFinished { success: true, .. } => break,
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                DriverEvent::ProcessExited => panic!("the agent exited before prompting"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|method| *method == "session/prompt")
+                .count(),
+            1,
+            "the acknowledgement must release the queued prompt exactly once"
+        );
+    }
+
+    #[test]
+    fn cancelling_while_replay_is_uncommitted_never_releases_a_queued_prompt() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        fixture.stage_load_history(&[]);
+        fixture.stage_load_success();
+        let driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+        driver.prompt(TurnPrompt {
+            id: uuid::Uuid::from_u128(91),
+            prompt: "must never run".into(),
+        });
+
+        assert!(wait_for_renoa_replay(&fixture).is_empty());
+        wait_for_renoa_connected(&fixture.event_rx);
+        driver.cancel();
+        loop {
+            match fixture
+                .event_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancelling the replay barrier should stop the runtime")
+            {
+                DriverEvent::ProcessExited => break,
+                DriverEvent::TurnStarted | DriverEvent::TurnFinished { .. } => {
+                    panic!("the cancelled prompt crossed the replay barrier")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !fixture
+                .methods()
+                .iter()
+                .any(|method| method == "session/prompt"),
+            "the cancelled prompt reached Renoa"
+        );
+        assert!(!driver.acknowledge_replay());
+    }
+
+    #[test]
+    fn renoa_load_collects_hundreds_of_ordered_chunks_before_responding() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        let turn_id = uuid::Uuid::new_v4();
+        let user_id = uuid::Uuid::new_v4();
+        let assistant_id = uuid::Uuid::new_v4();
+        let mut notifications = vec![renoa_notification(
+            durable_session,
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "prompt"},
+                "messageId": user_id.to_string(),
+                "_meta": {"requestId": turn_id.to_string()},
+            }),
+        )];
+        for index in 0..200 {
+            notifications.push(renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": format!("t{index},")},
+                    "messageId": assistant_id.to_string(),
+                }),
+            ));
+        }
+        for index in 0..200 {
+            notifications.push(renoa_notification(
+                durable_session,
+                json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": format!("r{index},")},
+                    "messageId": assistant_id.to_string(),
+                }),
+            ));
+        }
+        fixture.stage_load_history(&notifications);
+        fixture.stage_load_success();
+        let _driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+
+        let items = wait_for_renoa_replay(&fixture);
+        let ReplayItem::AssistantMessage(assistant) = &items[1] else {
+            panic!("assistant chunks retain one durable message identity");
+        };
+        assert_eq!(assistant.segments.len(), 400);
+        assert_eq!(assistant.segments[0], ReplaySegment::Text("t0,".into()));
+        assert_eq!(assistant.segments[199], ReplaySegment::Text("t199,".into()));
+        assert_eq!(
+            assistant.segments[200],
+            ReplaySegment::Reasoning("r0,".into())
+        );
+        assert_eq!(
+            assistant.segments[399],
+            ReplaySegment::Reasoning("r199,".into())
+        );
+        wait_for_renoa_connected(&fixture.event_rx);
+    }
+
+    #[test]
+    fn renoa_large_replay_fragments_fit_the_complete_server_wire_envelope() {
+        let replay = ProviderReplay {
+            items: vec![ReplayItem::UserMessage(ReplayUserMessage {
+                message_id: uuid::Uuid::new_v4(),
+                turn_id: uuid::Uuid::new_v4(),
+                text: "x".repeat(waku_protocol::SESSION_REPLAY_FRAGMENT_BYTES + 1),
+            })],
+        };
+        let events = prepare_replay_events(&replay).expect("fragment large replay");
+        assert!(events.len() > 1);
+        for event in events {
+            let wire = waku_protocol::event_to_wire(event).expect("encode fragment");
+            let envelope = waku_protocol::ServerMessage::Event(waku_protocol::SequencedEvent {
+                session_id: uuid::Uuid::new_v4(),
+                runtime_id: uuid::Uuid::new_v4(),
+                epoch: uuid::Uuid::new_v4(),
+                sequence: u64::MAX,
+                event: wire,
+            });
+            let size = serde_json::to_vec(&envelope)
+                .expect("serialize complete replay envelope")
+                .len();
+            assert!(size <= waku_protocol::MAX_WIRE_MESSAGE_BYTES);
+        }
+    }
+
+    #[test]
+    fn a_partial_renoa_replay_with_a_failed_load_commits_nothing() {
+        let fixture = FakeAcpAgent::new();
+        fixture.stage_load_history(&[renoa_notification(
+            "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f",
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "Half"},
+                "messageId": uuid::Uuid::new_v4().to_string(),
+                "_meta": {"requestId": uuid::Uuid::new_v4().to_string()},
+            }),
+        )]);
+        let _driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f".into(),
+            }),
+        );
+
+        let error = wait_for_renoa_error(&fixture.event_rx);
+        assert!(error.contains("failed to load Renoa session"));
+        // Drain everything the process still sends: the staged half-transcript
+        // must produce neither a replay commit nor a connected session.
+        loop {
+            match fixture
+                .event_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the process should exit after the failed load")
+            {
+                DriverEvent::ProcessExited => break,
+                DriverEvent::SessionReplayFragment { .. } => {
+                    panic!("a failed load committed a partial replay")
+                }
+                DriverEvent::Connected { .. } => {
+                    panic!("a failed load produced a connected session")
+                }
+                _ => {}
+            }
+        }
+        let methods = fixture.methods();
+        assert!(!methods.contains(&"session/new".to_owned()));
+    }
+
+    #[test]
+    fn a_malformed_renoa_replay_identity_fails_the_load() {
+        let fixture = FakeAcpAgent::new();
+        fixture.stage_load_history(&[
+            // A user chunk without any messageId cannot anchor semantic
+            // identity; the successful HTTP-shaped response changes nothing.
+            renoa_notification(
+                "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f",
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "No identity"},
+                }),
+            ),
+        ]);
+        fixture.stage_load_success();
+        let _driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f".into(),
+            }),
+        );
+
+        let error = wait_for_renoa_error(&fixture.event_rx);
+        assert!(
+            error.contains("failed to load Renoa session"),
+            "actual: {error}"
+        );
+        assert!(error.contains("missing its messageId"), "actual: {error}");
+        loop {
+            match fixture
+                .event_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the process should exit after the rejected replay")
+            {
+                DriverEvent::ProcessExited => break,
+                DriverEvent::SessionReplayFragment { .. } => {
+                    panic!("a malformed replay was committed")
+                }
+                DriverEvent::Connected { .. } => {
+                    panic!("a malformed replay produced a connected session")
+                }
+                _ => {}
+            }
+        }
+        let methods = fixture.methods();
+        assert!(!methods.contains(&"session/new".to_owned()));
+    }
+
+    #[test]
     fn existing_acp_providers_still_fall_back_to_session_new() {
         for provider in [ProviderKind::Grok, ProviderKind::Cursor] {
             let fixture = FakeAcpAgent::new();
             let session_id = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+            // Even when an agent replays updates during load, non-Renoa
+            // providers keep discarding them and falling back.
+            fixture.stage_load_history(&[renoa_notification(
+                session_id,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "load-time leak"},
+                    "messageId": uuid::Uuid::new_v4().to_string(),
+                }),
+            )]);
             let _driver = start_fake_acp(
                 &fixture,
                 provider,
@@ -2631,7 +4339,25 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
                     session_id.into(),
                 )),
             );
-            wait_for_acp_connected(&fixture.event_rx, provider);
+            let mut replay_seen = false;
+            loop {
+                match fixture
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the agent should report its session")
+                {
+                    DriverEvent::Connected {
+                        provider_cursor: Some(cursor),
+                    } if cursor.provider() == provider => break,
+                    DriverEvent::SessionReplayFragment { .. } => replay_seen = true,
+                    DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                !replay_seen,
+                "{provider:?} must not emit authoritative replays"
+            );
             let methods = fixture.methods();
             assert!(
                 methods.contains(&"initialize".to_owned()),

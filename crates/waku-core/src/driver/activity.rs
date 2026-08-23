@@ -18,23 +18,105 @@ pub(super) fn tool_activity(
     failed: bool,
     complete: bool,
 ) -> ActivityItem {
-    let raw_arguments = arguments;
-    let arguments = arguments
+    tool_activity_with_limit(
+        ToolActivityInput {
+            source_id,
+            kind,
+            title,
+            arguments,
+            output,
+            image_source,
+            failed,
+            complete,
+        },
+        Some(MAX_ACTIVITY_CHARS),
+    )
+}
+
+pub(super) struct ReplayToolActivity<'a> {
+    pub source_id: Option<String>,
+    pub kind: ActivityKind,
+    pub title: String,
+    pub arguments: Option<&'a Value>,
+    pub output: Option<&'a Value>,
+    pub raw_output: Option<&'a Value>,
+    pub image_source: Option<&'a Value>,
+    pub failed: bool,
+    pub complete: bool,
+}
+
+/// Builds the durable authoritative-replay form. Presentation may derive a
+/// bounded preview later, but persistence must not truncate provider history.
+pub(super) fn replay_tool_activity(input: ReplayToolActivity<'_>) -> ActivityItem {
+    let complete_arguments = input
+        .arguments
         .filter(|value| !value.is_null())
-        .and_then(format_json);
-    let formatted_output = output
+        .and_then(|value| format_json_with_limit(value, None));
+    let complete_output = input
+        .output
         .filter(|value| !value.is_null())
-        .and_then(format_output);
+        .and_then(|value| format_output(value, None));
+    let complete_raw_output = input
+        .raw_output
+        .filter(|value| !value.is_null())
+        .and_then(|value| format_json_with_limit(value, None));
+    let mut activity = tool_activity_with_limit(
+        ToolActivityInput {
+            source_id: input.source_id,
+            kind: input.kind,
+            title: input.title,
+            arguments: input.arguments,
+            output: input.output,
+            image_source: input.image_source,
+            failed: input.failed,
+            complete: input.complete,
+        },
+        Some(MAX_ACTIVITY_CHARS),
+    );
+    if complete_output != activity.output {
+        activity = activity.with_authoritative_output(complete_output);
+    }
+    if complete_arguments != activity.arguments {
+        activity = activity.with_authoritative_arguments(complete_arguments);
+    }
+    activity.with_authoritative_raw_output(complete_raw_output)
+}
+
+struct ToolActivityInput<'a> {
+    source_id: Option<String>,
+    kind: ActivityKind,
+    title: String,
+    arguments: Option<&'a Value>,
+    output: Option<&'a Value>,
+    image_source: Option<&'a Value>,
+    failed: bool,
+    complete: bool,
+}
+
+fn tool_activity_with_limit(
+    input: ToolActivityInput<'_>,
+    character_limit: Option<usize>,
+) -> ActivityItem {
+    let raw_arguments = input.arguments;
+    let arguments = input
+        .arguments
+        .filter(|value| !value.is_null())
+        .and_then(|value| format_json_with_limit(value, character_limit));
+    let formatted_output = input
+        .output
+        .filter(|value| !value.is_null())
+        .and_then(|value| format_output(value, character_limit));
     let mut image_urls = Vec::new();
-    if let Some(value) = output {
+    if let Some(value) = input.output {
         collect_image_urls(value, &mut image_urls);
     }
-    if let Some(value) = image_source {
+    if let Some(value) = input.image_source {
         collect_image_urls(value, &mut image_urls);
     }
     let mut seen = HashSet::new();
     image_urls.retain(|url| seen.insert(url.clone()));
-    let detail = failed
+    let detail = input
+        .failed
         .then(|| {
             formatted_output.as_deref()?.lines().find_map(|line| {
                 let line = line.trim();
@@ -43,12 +125,18 @@ pub(super) fn tool_activity(
         })
         .flatten();
 
-    ActivityItem::new(source_id, kind, title, detail, complete)
-        .with_arguments(arguments)
-        .with_activity_source(raw_arguments)
-        .with_output(formatted_output)
-        .with_image_urls(image_urls)
-        .with_failed(failed)
+    ActivityItem::new(
+        input.source_id,
+        input.kind,
+        input.title,
+        detail,
+        input.complete,
+    )
+    .with_arguments(arguments)
+    .with_activity_source(raw_arguments)
+    .with_output(formatted_output)
+    .with_image_urls(image_urls)
+    .with_failed(input.failed)
 }
 
 pub(super) fn input_title(value: Option<&Value>) -> Option<String> {
@@ -93,24 +181,24 @@ mod tests {
     }
 }
 
-pub(super) fn format_json(value: &Value) -> Option<String> {
+fn format_json_with_limit(value: &Value, character_limit: Option<usize>) -> Option<String> {
     serde_json::to_string_pretty(value)
         .ok()
-        .and_then(non_empty_text)
+        .and_then(|text| non_empty_text(text, character_limit))
 }
 
-fn format_output(value: &Value) -> Option<String> {
+fn format_output(value: &Value, character_limit: Option<usize>) -> Option<String> {
     if let Some(text) = value.as_str() {
-        return non_empty_text(text.to_owned());
+        return non_empty_text(text.to_owned(), character_limit);
     }
     if let Some(structured) = value
         .get("structuredContent")
         .filter(|value| !value.is_null())
     {
-        return format_json(structured);
+        return format_json_with_limit(structured, character_limit);
     }
     if let Some(content) = value.get("content").filter(|value| !value.is_null()) {
-        return format_output(content);
+        return format_output(content, character_limit);
     }
     if let Some(items) = value.as_array() {
         let text = items
@@ -121,14 +209,14 @@ fn format_output(value: &Value) -> Option<String> {
                     (item.get("type").and_then(Value::as_str) == Some("text"))
                         .then(|| item.get("text").and_then(Value::as_str).map(str::to_owned))
                         .flatten()
-                        .or_else(|| format_json(item))
+                        .or_else(|| format_json_with_limit(item, character_limit))
                 })
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        return non_empty_text(text);
+        return non_empty_text(text, character_limit);
     }
-    format_json(value)
+    format_json_with_limit(value, character_limit)
 }
 
 fn collect_image_urls(value: &Value, urls: &mut Vec<String>) {
@@ -195,15 +283,21 @@ fn is_image_item(value: &Value) -> bool {
         || (item_type == Some("file") && mime.is_some_and(|mime| mime.starts_with("image/")))
 }
 
-fn non_empty_text(value: String) -> Option<String> {
+fn non_empty_text(value: String, character_limit: Option<usize>) -> Option<String> {
+    if character_limit.is_none() {
+        return (!value.is_empty()).then_some(value);
+    }
     let value = value.trim().to_owned();
     if value.is_empty() {
         return None;
     }
-    if value.chars().count() <= MAX_ACTIVITY_CHARS {
+    let Some(character_limit) = character_limit else {
+        return Some(value);
+    };
+    if value.chars().count() <= character_limit {
         return Some(value);
     }
-    let mut truncated = value.chars().take(MAX_ACTIVITY_CHARS).collect::<String>();
+    let mut truncated = value.chars().take(character_limit).collect::<String>();
     truncated.push_str(&tr!("activity.output_truncated"));
     Some(truncated)
 }

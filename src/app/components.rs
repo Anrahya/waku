@@ -1543,6 +1543,25 @@ mod message_time_tests {
             Some("Output")
         );
         assert_eq!(activity_preview(&image_only), "Image output");
+
+        let replayed = ActivityItem::new(
+            Some("tool-3".into()),
+            crate::model::ActivityKind::Tool,
+            "Large result",
+            None,
+            true,
+        )
+        .with_output(Some("bounded preview".into()))
+        .with_authoritative_output(Some(format!("{}END", "x".repeat(40_000))));
+        assert_eq!(
+            activity_disclosure_text(&replayed).as_deref(),
+            Some("Output\nbounded preview")
+        );
+        assert!(
+            replayed
+                .durable_output()
+                .is_some_and(|output| output.len() > 40_000 && output.ends_with("END"))
+        );
     }
 
     #[test]

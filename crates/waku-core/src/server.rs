@@ -899,6 +899,11 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
         Command::RemoveSession
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
+        Command::CommitRenoaReplay { fragment }
+            if fragment.index.checked_add(1) == Some(fragment.total) =>
+        {
+            TaskCatalogAction::Changed
+        }
         _ => TaskCatalogAction::None,
     }
 }

@@ -3,7 +3,24 @@ import type { ActivityFileChange } from "./ActivityFileChange";
 import type { ActivityKind } from "./ActivityKind";
 import type { ReasoningBlock } from "./ReasoningBlock";
 
-export type ActivityItem = { id: string, source_id: string | null, kind: ActivityKind, title: string, detail: string | null, arguments?: string | null, output?: string | null,
+export type ActivityItem = { id: string, source_id: string | null, kind: ActivityKind, title: string, detail: string | null, arguments?: string | null,
+/**
+ * Complete provider-owned input when `arguments` is only a bounded UI
+ * preview. Authoritative replay uses this for lossless durable state.
+ */
+authoritative_arguments?: string | null, output?: string | null,
+/**
+ * Complete provider-owned output when `output` is only a bounded UI
+ * preview. Live activity keeps this empty; authoritative replay fills it
+ * only when the complete value differs from the presentation string.
+ */
+authoritative_output?: string | null,
+/**
+ * Complete ACP `rawOutput` beside the standard content result. Renoa can
+ * provide both, and replay persistence must not discard the structured
+ * diagnostic value merely because the UI presents `output`.
+ */
+authoritative_raw_output?: string | null,
 /**
  * Images returned by a tool, kept separate from text so large data URLs
  * are never truncated or treated as literal activity output.

@@ -2,6 +2,7 @@ use anyhow::{Context as _, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::WireDriverEvent;
 use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
@@ -34,6 +35,20 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         DriverEvent::AvailableCommands(commands) => {
             ("availableCommands", serde_json::to_value(commands)?)
         }
+        DriverEvent::SessionReplayFragment {
+            replay_id,
+            index,
+            total,
+            json,
+        } => (
+            "sessionReplay",
+            json!({
+                "replayId": replay_id,
+                "index": index,
+                "total": total,
+                "json": json,
+            }),
+        ),
         DriverEvent::TurnStarted => ("turnStarted", Value::Null),
         DriverEvent::TextDelta(text) => ("textDelta", Value::String(text)),
         DriverEvent::ReasoningDelta(text) => ("reasoningDelta", Value::String(text)),
@@ -124,6 +139,15 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "autoTitleUpdated" => DriverEvent::AutoTitleUpdated(serde_json::from_value(payload)?),
         "availableCommands" => DriverEvent::AvailableCommands(serde_json::from_value(payload)?),
         "turnStarted" => DriverEvent::TurnStarted,
+        "sessionReplay" => {
+            let fragment: SessionReplayFragmentWire = serde_json::from_value(payload)?;
+            DriverEvent::SessionReplayFragment {
+                replay_id: fragment.replay_id,
+                index: fragment.index,
+                total: fragment.total,
+                json: fragment.json,
+            }
+        }
         "textDelta" => DriverEvent::TextDelta(serde_json::from_value(payload)?),
         "reasoningDelta" => DriverEvent::ReasoningDelta(serde_json::from_value(payload)?),
         "activity" => {
@@ -256,10 +280,47 @@ struct TurnFinishedWire {
     summary: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionReplayFragmentWire {
+    replay_id: Uuid,
+    index: usize,
+    total: usize,
+    json: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{UserInputOption, UserInputQuestion};
+    use uuid::Uuid;
+
+    #[test]
+    fn authoritative_replay_fragment_round_trips_through_the_driver_wire() {
+        let replay_id = Uuid::new_v4();
+        let fragment = r#"{"items":[]}"#.to_owned();
+        let wire = event_to_wire(DriverEvent::SessionReplayFragment {
+            replay_id,
+            index: 1,
+            total: 3,
+            json: fragment.clone(),
+        })
+        .unwrap();
+        assert_eq!(wire.kind, "sessionReplay");
+        let DriverEvent::SessionReplayFragment {
+            replay_id: decoded_id,
+            index,
+            total,
+            json,
+        } = event_from_wire(wire).unwrap()
+        else {
+            panic!("the replay changed variants during its wire round trip");
+        };
+        assert_eq!(decoded_id, replay_id);
+        assert_eq!(index, 1);
+        assert_eq!(total, 3);
+        assert_eq!(json, fragment);
+    }
 
     #[test]
     fn structured_user_input_round_trips_through_the_daemon_wire() {

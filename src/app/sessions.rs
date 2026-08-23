@@ -129,6 +129,11 @@ impl Waku {
                         } else {
                             false
                         };
+                        // Hydration completed; a replay buffered before the
+                        // transcript was whole can now be reconciled.
+                        if replaced {
+                            waku.apply_pending_session_replay(session_id, cx);
+                        }
                         let pending = waku
                             .pending_session_activation
                             .filter(|pending| pending.session_id == session_id);
@@ -150,7 +155,9 @@ impl Waku {
                         {
                             waku.pending_session_activation = None;
                         }
-                        waku.show_toast(tr!("errors.open_session", error = error));
+                        if !waku.fail_replay_hydration(session_id, &error) {
+                            waku.show_toast(tr!("errors.open_session", error = error));
+                        }
                     }
                 }
                 cx.notify();

@@ -40,6 +40,7 @@ pub mod model_catalog;
 pub mod persistence;
 pub mod projectless;
 pub mod provider_session;
+pub mod replay;
 pub mod settings;
 pub mod skills;
 pub mod theme;
@@ -54,8 +55,9 @@ pub use driver_wire::{decode_enum, encode_enum, event_from_wire, event_to_wire};
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
     MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
-    ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireComputerToolRequest,
-    WireDriverEvent, WireDriverStartOptions, WireSessionOptions,
+    ResponsePayload, RpcError, SESSION_REPLAY_FRAGMENT_BYTES, SESSION_REPLAY_MAX_BYTES,
+    SequencedEvent, ServerMessage, WireComputerToolRequest, WireDriverEvent,
+    WireDriverStartOptions, WireSessionOptions,
 };
 pub use settings::DaemonSettings;
 pub use turn::TurnPrompt;
