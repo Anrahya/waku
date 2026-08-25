@@ -44,7 +44,7 @@ impl ProviderKind {
     ];
 
     /// Providers shown in picker, settings, and new-session selection.
-    pub const SELECTABLE: [Self; 11] = [
+    pub const SELECTABLE: [Self; 12] = [
         Self::Amp,
         Self::Claude,
         Self::Codex,
@@ -56,6 +56,7 @@ impl ProviderKind {
         Self::Kimi,
         Self::OhMyPi,
         Self::Pi,
+        Self::Renoa,
     ];
 
     pub fn is_selectable(self) -> bool {
@@ -188,6 +189,7 @@ impl ProviderKind {
                 | Self::Kimi
                 | Self::OhMyPi
                 | Self::Pi
+                | Self::Renoa
         )
     }
 }
@@ -3957,9 +3959,9 @@ mod tests {
         assert_eq!(ProviderKind::Renoa.display_name(), "Renoa");
         assert_eq!(ProviderKind::Renoa.command(), "renoa-agent");
         assert!(ProviderKind::ALL.contains(&ProviderKind::Renoa));
-        assert!(!ProviderKind::SELECTABLE.contains(&ProviderKind::Renoa));
-        assert!(!ProviderKind::Renoa.is_selectable());
-        assert_eq!(ProviderKind::Renoa.for_new_task(), ProviderKind::Codex);
+        assert!(ProviderKind::SELECTABLE.contains(&ProviderKind::Renoa));
+        assert!(ProviderKind::Renoa.is_selectable());
+        assert_eq!(ProviderKind::Renoa.for_new_task(), ProviderKind::Renoa);
         assert_eq!(ProviderKind::Grok.for_new_task(), ProviderKind::Grok);
     }
 
@@ -3995,7 +3997,7 @@ mod tests {
         assert!(ProviderKind::OpenCode.supports_model_discovery());
         assert!(ProviderKind::Grok.supports_model_discovery());
         assert!(ProviderKind::Pi.supports_model_discovery());
-        assert!(!ProviderKind::Renoa.supports_model_discovery());
+        assert!(ProviderKind::Renoa.supports_model_discovery());
     }
 
     #[test]

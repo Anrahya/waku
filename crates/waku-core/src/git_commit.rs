@@ -734,6 +734,9 @@ mod tests {
     fn every_provider_uses_a_noninteractive_generation_mode() {
         let prompt = "Generate subject";
         for provider in ProviderKind::SELECTABLE {
+            if provider == ProviderKind::Renoa {
+                continue;
+            }
             let args = agent_arguments(
                 provider,
                 Some("model"),
@@ -806,9 +809,7 @@ mod tests {
                     assert!(has_pair(&args, "--output-format", "text"));
                     assert!(has_pair(&args, "--model", "model"));
                 }
-                ProviderKind::Renoa => {
-                    unreachable!("Renoa is omitted from ProviderKind::SELECTABLE")
-                }
+                ProviderKind::Renoa => {}
             }
         }
     }
@@ -845,6 +846,7 @@ mod tests {
 
     #[test]
     fn renoa_rejects_commit_message_generation() {
+        assert!(ProviderKind::SELECTABLE.contains(&ProviderKind::Renoa));
         let error = generate_message(
             Path::new("/tmp"),
             false,

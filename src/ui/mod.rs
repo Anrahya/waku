@@ -194,7 +194,7 @@ pub fn provider_icon(provider: ProviderKind) -> &'static str {
         ProviderKind::Kimi => "icons/provider-kimi.svg",
         ProviderKind::OhMyPi => "icons/provider-ohmypi.svg",
         ProviderKind::Pi => "icons/provider-pi.svg",
-        ProviderKind::Renoa => "icons/bot.svg",
+        ProviderKind::Renoa => "icons/provider-renoa.svg",
     }
 }
 

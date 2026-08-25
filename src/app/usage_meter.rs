@@ -393,19 +393,10 @@ fn usage_panel(
         .gap(px(12.0))
         .text_size(sp(12.0));
 
-    // The context row always renders; a session with nothing measured yet
-    // reads "0" over an empty track, exactly like the CLI's own panel.
-    let usage = context.unwrap_or_default();
-    let percent = context_percent(usage);
-    let value = match (usage.window, percent) {
-        (Some(window), Some(percent)) => format!(
-            "{} / {} ({percent:.0}%)",
-            format_tokens(usage.tokens),
-            format_tokens(window)
-        ),
-        // The transport reports occupancy but not the window size.
-        _ => format_tokens(usage.tokens),
-    };
+    // The context row always renders. Missing telemetry is unknown, not a
+    // measured zero; the empty track already communicates that distinction.
+    let percent = context.and_then(context_percent);
+    let value = context_usage_value(context);
     panel = panel.child(
         div()
             .flex()
@@ -531,6 +522,21 @@ fn usage_panel(
     panel.into_any_element()
 }
 
+fn context_usage_value(context: Option<ContextUsage>) -> String {
+    let Some(usage) = context else {
+        return "—".to_owned();
+    };
+    match (usage.window, context_percent(usage)) {
+        (Some(window), Some(percent)) => format!(
+            "{} / {} ({percent:.0}%)",
+            format_tokens(usage.tokens),
+            format_tokens(window)
+        ),
+        // The transport reports occupancy but not the window size.
+        _ => format_tokens(usage.tokens),
+    }
+}
+
 /// Placeholder for the plan section while its first fetch is in flight:
 /// a header bar and two quota rows, pulsing gently. `with_animation` honors
 /// the system's reduce-motion setting on its own.
@@ -604,4 +610,14 @@ fn meter_bar(theme: &Theme, percent: f64) -> Div {
         .rounded_full()
         .bg(theme.overlay_strong)
         .child(div().h_full().w(relative(fraction)).rounded_full().bg(fill))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::context_usage_value;
+
+    #[test]
+    fn missing_context_usage_is_not_presented_as_zero() {
+        assert_eq!(context_usage_value(None), "—");
+    }
 }

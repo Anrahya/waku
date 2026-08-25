@@ -1,5 +1,7 @@
 //! Provider model and agent-preset discovery.
 
+mod renoa;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -85,8 +87,8 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         }
         // Pi, Oh My Pi, and Kimi Code all take their catalog from the user's
         // configured LLM providers. A fabricated fallback would make
-        // unavailable models look selectable. Renoa's catalog is owned by the
-        // ACP process and is not selected in this slice.
+        // unavailable models look selectable. Renoa follows the same rule:
+        // its authenticated catalog is authoritative and has no fallback.
         ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi | ProviderKind::Renoa => {
             Vec::new()
         }
@@ -134,9 +136,14 @@ pub fn discover_catalog(
         ProviderKind::Kimi => (discover_kimi_models(binary), None),
         ProviderKind::Pi => (discover_pi_models(binary, PiDialect::Pi), None),
         ProviderKind::OhMyPi => (discover_pi_models(binary, PiDialect::OhMyPi), None),
-        ProviderKind::Renoa => (Vec::new(), None),
+        ProviderKind::Renoa => (renoa::discover_models(binary), None),
     };
-    let models = if discovered.is_empty() {
+    let models = if provider == ProviderKind::Renoa && discovered.is_empty() {
+        // Renoa's probe validates one complete authenticated catalog. A
+        // malformed or rejected live result must withdraw the provider's
+        // models instead of reviving a stale cache as executable truth.
+        Vec::new()
+    } else if discovered.is_empty() {
         // A failed or empty probe keeps the last successful discovery over
         // the hardcoded catalog, so one bad CLI run can't shrink the picker.
         cached_models(provider).unwrap_or_else(|| fallback_models(provider))

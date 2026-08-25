@@ -1812,7 +1812,9 @@ function UsageMeter({
               percent={contextPercent ?? 0}
               value={context?.window && contextPercent != null
                 ? `${formatTokens(context.tokens)} / ${formatTokens(context.window)} (${contextPercent.toFixed(0)}%)`
-                : formatTokens(context?.tokens ?? 0)}
+                : context
+                  ? formatTokens(context.tokens)
+                  : '—'}
             />
             {(plan.data || plan.isFetching || error) && <div className="h-px bg-border" />}
             {plan.data && <PlanUsageLanes locale={locale} plan={plan.data} provider={session.provider} t={t} />}

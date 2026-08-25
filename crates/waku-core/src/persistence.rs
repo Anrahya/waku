@@ -543,6 +543,11 @@ impl PersistedState {
 
     fn migrate_loaded(&mut self) {
         for session in &mut self.sessions {
+            let renoa_model_migrated = session.provider == ProviderKind::Renoa
+                && session
+                    .model
+                    .as_mut()
+                    .is_some_and(qualify_legacy_renoa_model);
             let checkpoint_totals_current = session.turns.iter().all(|turn| {
                 turn.checkpoint
                     .as_ref()
@@ -556,7 +561,8 @@ impl PersistedState {
             session.migrate_legacy_state();
             session.backfill_last_reply_at();
             // Migration rewrote this session, so the stored row is stale.
-            if !checkpoint_totals_current
+            if renoa_model_migrated
+                || !checkpoint_totals_current
                 || before
                     != (
                         session.turns.len(),
@@ -569,6 +575,16 @@ impl PersistedState {
         }
         self.version = STATE_VERSION;
         normalize_computer_app_grants(&mut self.computer_use_allowed_apps);
+        if self.last_provider == ProviderKind::Renoa
+            && let Some(model) = &mut self.last_model
+        {
+            qualify_legacy_renoa_model(model);
+        }
+        for traits in &mut self.remembered_model_traits {
+            if traits.provider == ProviderKind::Renoa {
+                qualify_legacy_renoa_model(&mut traits.model);
+            }
+        }
         self.backfill_remembered_selection();
         self.normalize_hidden_selection();
     }
@@ -612,6 +628,14 @@ impl PersistedState {
         self.last_service_tier = None;
         self.last_context_window = None;
     }
+}
+
+fn qualify_legacy_renoa_model(model: &mut String) -> bool {
+    if model.contains('/') {
+        return false;
+    }
+    model.insert_str(0, "xai/");
+    true
 }
 
 /// Rewrites inline `data:` payloads into blob references, in place.
@@ -3540,7 +3564,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_hidden_renoa_selection_loads_as_a_clean_codex_draft() {
+    fn remembered_renoa_selection_and_bound_history_survive_reload() {
         let directory = temporary_directory();
         let store = store_in(&directory);
         let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
@@ -3549,14 +3573,17 @@ mod tests {
             let session = state.session_mut(restored_id).unwrap();
             session.provider = ProviderKind::Renoa;
             session.model = Some("renoa-alpha".into());
+            session.reasoning_effort = Some("high".into());
+            session.provider_cursor = Some(crate::model::ProviderResumeCursor::Renoa {
+                session_id: "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f".into(),
+            });
             session.begin_turn("Started");
             session.finish_active_turn(crate::model::TurnStatus::Completed);
         }
         store.save(&mut state).unwrap();
 
-        // Stale serialized app state: Renoa is remembered as the next
-        // provider together with its model traits, while the recorded
-        // selected session no longer exists.
+        // Renoa is remembered for the next task while the recorded selected
+        // session no longer exists, forcing restoration to seed a new draft.
         let app_state_path = directory.join("state.json");
         let mut app_state: serde_json::Value =
             serde_json::from_slice(&fs::read(&app_state_path).unwrap()).unwrap();
@@ -3564,34 +3591,43 @@ mod tests {
         object.insert("last_provider".into(), serde_json::json!("renoa"));
         object.insert("last_model".into(), serde_json::json!("renoa-alpha"));
         object.insert("last_reasoning_effort".into(), serde_json::json!("high"));
-        object.insert("last_service_tier".into(), serde_json::json!("fast"));
-        object.insert("last_context_window".into(), serde_json::json!("262144"));
         object.insert(
             "selected_session".into(),
             serde_json::json!(Uuid::new_v4().to_string()),
         );
         fs::write(&app_state_path, serde_json::to_vec(&app_state).unwrap()).unwrap();
 
-        let restored = store_in(&directory).load_or_fresh(PathBuf::from("/tmp/project"));
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load_or_fresh(PathBuf::from("/tmp/project"));
 
-        // The remembered next-task selection normalized to Codex and lost
-        // every Renoa trait.
-        assert_eq!(restored.last_provider, ProviderKind::Codex);
-        assert_eq!(restored.last_model, None);
-        assert_eq!(restored.last_reasoning_effort, None);
+        assert_eq!(restored.last_provider, ProviderKind::Renoa);
+        assert_eq!(restored.last_model.as_deref(), Some("xai/renoa-alpha"));
+        assert_eq!(restored.last_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(restored.last_service_tier, None);
         assert_eq!(restored.last_context_window, None);
 
-        // The restored Renoa session itself keeps its provider and model.
-        let kept = restored
+        // The existing task keeps both the explicit Renoa binding and its
+        // persisted transcript while the remembered choice seeds the draft.
+        let kept_index = restored
             .sessions
             .iter()
-            .find(|session| session.id == restored_id)
+            .position(|session| session.id == restored_id)
             .expect("the restored session survives the reload");
+        reopened
+            .hydrate(&mut restored.sessions[kept_index])
+            .expect("hydrate the restored Renoa transcript");
+        let kept = &restored.sessions[kept_index];
         assert_eq!(kept.provider, ProviderKind::Renoa);
-        assert_eq!(kept.model.as_deref(), Some("renoa-alpha"));
+        assert_eq!(kept.model.as_deref(), Some("xai/renoa-alpha"));
+        assert_eq!(
+            kept.provider_cursor,
+            Some(crate::model::ProviderResumeCursor::Renoa {
+                session_id: "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f".into(),
+            })
+        );
+        assert!(!kept.messages.is_empty());
+        assert!(!kept.turns.is_empty());
 
-        // The draft created for the missing selection is clean Codex.
         let draft_id = restored.selected_session.unwrap();
         assert_ne!(draft_id, restored_id);
         let draft = restored
@@ -3599,16 +3635,16 @@ mod tests {
             .iter()
             .find(|session| session.id == draft_id)
             .expect("a draft exists for the missing selection");
-        assert_eq!(draft.provider, ProviderKind::Codex);
-        assert_eq!(draft.model, None);
-        assert_eq!(draft.reasoning_effort, None);
+        assert_eq!(draft.provider, ProviderKind::Renoa);
+        assert_eq!(draft.model.as_deref(), Some("xai/renoa-alpha"));
+        assert_eq!(draft.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(draft.service_tier, None);
         assert_eq!(draft.context_window, None);
         fs::remove_dir_all(directory).ok();
     }
 
     #[test]
-    fn backfill_skips_a_hidden_selected_session() {
+    fn backfill_includes_a_selectable_renoa_session() {
         let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
         state.sessions[0].provider = ProviderKind::Renoa;
         state.sessions[0].model = Some("renoa-alpha".into());
@@ -3616,7 +3652,44 @@ mod tests {
 
         state.backfill_remembered_selection();
 
-        assert_eq!(state.last_model, None);
+        assert_eq!(state.last_model.as_deref(), Some("renoa-alpha"));
+    }
+
+    #[test]
+    fn legacy_renoa_models_gain_their_historical_xai_provider() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        state.sessions[0].provider = ProviderKind::Renoa;
+        state.sessions[0].model = Some("grok-4.6".into());
+        state.last_provider = ProviderKind::Renoa;
+        state.last_model = Some("grok-4.6".into());
+        state.remember_model_traits(
+            ProviderKind::Renoa,
+            "grok-4.6",
+            Some("high".into()),
+            None,
+            None,
+        );
+        state.remember_model_traits(
+            ProviderKind::Codex,
+            "gpt-5.6-sol",
+            Some("max".into()),
+            None,
+            None,
+        );
+
+        state.migrate_loaded();
+
+        assert_eq!(state.sessions[0].model.as_deref(), Some("xai/grok-4.6"));
+        assert_eq!(state.last_model.as_deref(), Some("xai/grok-4.6"));
+        assert_eq!(
+            state.model_traits_for(ProviderKind::Renoa, "xai/grok-4.6"),
+            (Some("high".into()), None, None)
+        );
+        assert_eq!(
+            state.model_traits_for(ProviderKind::Codex, "gpt-5.6-sol"),
+            (Some("max".into()), None, None),
+            "non-Renoa model keys stay unchanged"
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! unknown-method errors, stdio lifetime, and protocol type validation. Waku
 //! only adapts typed ACP messages to its provider-neutral [`DriverEvent`]s.
 
+mod renoa_config;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -551,7 +553,7 @@ async fn run_sdk_connection(
             // no individual wire frame grows with the transcript.
             let replay_events = replay
                 .as_ref()
-                .map(prepare_replay_events)
+                .map(|loaded| prepare_replay_events(&loaded.replay))
                 .transpose()
                 .map_err(replay_transport_error)?;
             if let Some(replay_events) = replay_events {
@@ -584,17 +586,40 @@ async fn run_sdk_connection(
                 let _ = events.send(connected);
             }
 
+            if let Some(usage) = replay.as_ref().and_then(|loaded| loaded.usage) {
+                events
+                    .send(DriverEvent::UsageUpdated {
+                        context_tokens: usage.context_tokens,
+                        context_window: usage.context_window,
+                    })
+                    .map_err(|_| replay_transport_error(ReplayTransportError::ConsumerClosed))?;
+            }
+
             let mut current_model = model;
-            apply_model(
-                &connection,
-                provider,
-                &session_id,
-                config_options.as_deref(),
-                current_model.as_deref(),
-                reasoning_effort.as_deref(),
-                &events,
-            )
-            .await;
+            let mut current_reasoning_effort = reasoning_effort;
+            let mut current_config_options = config_options.unwrap_or_default();
+            if provider == ProviderKind::Renoa {
+                current_config_options = renoa_config::apply(
+                    &connection,
+                    &session_id,
+                    current_config_options,
+                    current_model.as_deref(),
+                    current_reasoning_effort.as_deref(),
+                )
+                .await
+                .map_err(renoa_config_error)?;
+            } else {
+                apply_model(
+                    &connection,
+                    provider,
+                    &session_id,
+                    Some(&current_config_options),
+                    current_model.as_deref(),
+                    current_reasoning_effort.as_deref(),
+                    &events,
+                )
+                .await;
+            }
             let mut fork_context = fork_context;
 
             while let Ok(command) = commands.recv().await {
@@ -710,13 +735,40 @@ async fn run_sdk_connection(
                         }
                     }
                     CommandMessage::Options(options) => {
-                        if options.model != current_model {
+                        if provider == ProviderKind::Renoa {
+                            let model_changed = options.model != current_model;
+                            let reasoning_changed =
+                                options.reasoning_effort != current_reasoning_effort;
+                            if model_changed || reasoning_changed {
+                                let model_update = if model_changed {
+                                    options.model.as_deref()
+                                } else {
+                                    None
+                                };
+                                let reasoning_update = if model_changed || reasoning_changed {
+                                    options.reasoning_effort.as_deref()
+                                } else {
+                                    None
+                                };
+                                current_config_options = renoa_config::apply(
+                                    &connection,
+                                    &session_id,
+                                    current_config_options,
+                                    model_update,
+                                    reasoning_update,
+                                )
+                                .await
+                                .map_err(renoa_config_error)?;
+                                current_model = options.model;
+                                current_reasoning_effort = options.reasoning_effort;
+                            }
+                        } else if options.model != current_model {
                             current_model = options.model;
                             apply_model(
                                 &connection,
                                 provider,
                                 &session_id,
-                                config_options.as_deref(),
+                                Some(&current_config_options),
                                 current_model.as_deref(),
                                 options.reasoning_effort.as_deref(),
                                 &events,
@@ -822,6 +874,12 @@ fn replay_transport_error(error: ReplayTransportError) -> agent_client_protocol:
     acp_error
 }
 
+fn renoa_config_error(error: renoa_config::ConfigError) -> agent_client_protocol::Error {
+    let mut acp_error = agent_client_protocol::Error::internal_error();
+    acp_error.message = format!("could not configure Renoa session: {error}");
+    acp_error
+}
+
 async fn establish_session(
     connection: &ConnectionTo<Agent>,
     provider: ProviderKind,
@@ -834,7 +892,7 @@ async fn establish_session(
     SessionId,
     Option<SessionModeState>,
     Option<Vec<SessionConfigOption>>,
-    Option<ProviderReplay>,
+    Option<RenoaLoadedReplay>,
 )> {
     if let Some(existing) = resume_session_id {
         if provider != ProviderKind::Renoa
@@ -2003,13 +2061,15 @@ fn fx_context_notice(text: &str) -> bool {
 /// Captures Renoa's durable-history replay while `session/load` is in flight.
 ///
 /// Updates are validated and grouped as they arrive, so the buffer can only
-/// finalize as a complete, well-identified transcript. Known configuration
-/// and status updates carry no transcript semantics and are ignored on
-/// purpose; any other unrecognized kind fails the load instead of silently
+/// finalize as a complete, well-identified transcript. Context usage is held
+/// beside that transcript until the consumer acknowledges the replay. Known
+/// configuration and status updates carry no transcript semantics and are
+/// ignored; any other unrecognized kind fails the load instead of silently
 /// truncating history.
 #[derive(Default)]
 struct RenoaReplayCapture {
     items: Vec<ReplayItem>,
+    usage: Option<ReplayedContextUsage>,
     error: Option<String>,
     user_turns: HashMap<uuid::Uuid, uuid::Uuid>,
     turn_messages: HashMap<uuid::Uuid, uuid::Uuid>,
@@ -2033,12 +2093,20 @@ impl RenoaReplayCapture {
             }
             SessionUpdate::ToolCall(call) => self.tool_call(call),
             SessionUpdate::ToolCallUpdate(update) => self.tool_update(update),
+            SessionUpdate::UsageUpdate(usage) => {
+                let usage = ReplayedContextUsage {
+                    context_tokens: (usage.used > 0).then_some(usage.used),
+                    context_window: (usage.size > 0).then_some(usage.size),
+                };
+                if usage.context_tokens.is_some() || usage.context_window.is_some() {
+                    self.usage = Some(usage);
+                }
+            }
             SessionUpdate::Plan(_)
             | SessionUpdate::AvailableCommandsUpdate(_)
             | SessionUpdate::CurrentModeUpdate(_)
             | SessionUpdate::ConfigOptionUpdate(_)
-            | SessionUpdate::SessionInfoUpdate(_)
-            | SessionUpdate::UsageUpdate(_) => {}
+            | SessionUpdate::SessionInfoUpdate(_) => {}
             _ => self.fail(
                 "the load replay carried an unknown update kind; \
                  refusing to build a partial transcript",
@@ -2379,14 +2447,29 @@ impl RenoaReplayCapture {
         }
     }
 
-    fn finalize(self) -> anyhow::Result<ProviderReplay> {
+    fn finalize(self) -> anyhow::Result<RenoaLoadedReplay> {
         if let Some(error) = self.error {
             anyhow::bail!("{error}");
         }
         let replay = ProviderReplay { items: self.items };
         replay.validate()?;
-        Ok(replay)
+        Ok(RenoaLoadedReplay {
+            replay,
+            usage: self.usage,
+        })
     }
+}
+
+#[derive(Debug)]
+struct RenoaLoadedReplay {
+    replay: ProviderReplay,
+    usage: Option<ReplayedContextUsage>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayedContextUsage {
+    context_tokens: Option<u64>,
+    context_window: Option<u64>,
 }
 
 fn unsupported_tool_result(call_id: &str, what: &str) -> String {
@@ -2697,9 +2780,21 @@ fn main() {
                     "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{\"loadSession\":true,\"sessionCapabilities\":{{{resume_capability}}}}},\"agentInfo\":{{\"name\":\"fake-acp\",\"version\":\"0\"}}}}}}"
                 )
             }
-            "session/new" => format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"sessionId\":\"new-session\"}}}}"
-            ),
+            "session/new" => {
+                let config_options = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|dir| dir.join("advertise-renoa-config")))
+                    .is_some_and(|marker| marker.exists())
+                    .then_some(concat!(
+                        ",\"configOptions\":[",
+                        "{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-a\",\"options\":[{\"value\":\"grok-a\",\"name\":\"Grok A\"},{\"value\":\"grok-b\",\"name\":\"Grok B\"}]},",
+                        "{\"id\":\"thought_level\",\"name\":\"Reasoning\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"low\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"}]}]"
+                    ))
+                    .unwrap_or("");
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"sessionId\":\"new-session\"{config_options}}}}}"
+                )
+            }
             "session/load" => {
                 // A scripted history is replayed as ordinary session/update
                 // notifications before the response, mirroring Renoa's
@@ -2739,6 +2834,24 @@ fn main() {
             "session/resume" => format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}"
             ),
+            "session/set_config_option" => {
+                let current_reasoning = if line.contains("\"configId\":\"thought_level\"")
+                    && line.contains("\"value\":\"high\"")
+                {
+                    "high"
+                } else {
+                    "low"
+                };
+                format!(
+                    concat!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"configOptions\":[",
+                        "{{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-b\",\"options\":[{{\"value\":\"grok-a\",\"name\":\"Grok A\"}},{{\"value\":\"grok-b\",\"name\":\"Grok B\"}}]}},",
+                        "{{\"id\":\"thought_level\",\"name\":\"Reasoning\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"{current_reasoning}\",\"options\":[{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"high\",\"name\":\"High\"}}]}}]}}}}"
+                    ),
+                    id = id,
+                    current_reasoning = current_reasoning,
+                )
+            }
             "session/prompt" => format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"stopReason\":\"end_turn\"}}}}"
             ),
@@ -2782,32 +2895,55 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 }
 "#;
 
-    /// Compiles the fake agent once per test process and caches only its
-    /// bytes. The build directory is a temp dir dropped before returning, so
-    /// nothing leaks outside the per-fixture directories below.
-    fn fake_acp_agent_binary() -> &'static [u8] {
+    struct CompiledFakeAgent {
+        binary: std::path::PathBuf,
+        _root: TempDir,
+    }
+
+    #[derive(Default)]
+    struct CompiledFakeAgentCache {
+        cached: std::sync::Mutex<std::sync::Weak<CompiledFakeAgent>>,
+    }
+
+    impl CompiledFakeAgentCache {
+        fn acquire(&self) -> Arc<CompiledFakeAgent> {
+            let mut cached = self.cached.lock().expect("lock fake ACP agent cache");
+            if let Some(compiled) = cached.upgrade() {
+                return compiled;
+            }
+
+            let build = TempDir::new();
+            let source = build.path().join("fake_acp_agent.rs");
+            let binary = build.path().join(if cfg!(windows) {
+                "fake_acp_agent.exe"
+            } else {
+                "fake_acp_agent"
+            });
+            std::fs::write(&source, FAKE_ACP_AGENT_SOURCE).expect("write fake ACP source");
+            let status = std::process::Command::new("rustc")
+                .args(["--edition", "2021", "-o"])
+                .arg(&binary)
+                .arg(&source)
+                .status()
+                .expect("rustc is required to build the fake ACP agent");
+            assert!(status.success(), "rustc failed to build the fake ACP agent");
+
+            let compiled = Arc::new(CompiledFakeAgent {
+                binary,
+                _root: build,
+            });
+            *cached = Arc::downgrade(&compiled);
+            compiled
+        }
+    }
+
+    /// Shares one immutable binary only while fixtures are alive. The static
+    /// cache owns a `Weak`, so the build directory is removed with the last
+    /// fixture instead of leaking at test-process exit.
+    fn fake_acp_agent_binary() -> Arc<CompiledFakeAgent> {
         use std::sync::OnceLock;
-        static BINARY: OnceLock<Vec<u8>> = OnceLock::new();
-        BINARY
-            .get_or_init(|| {
-                let build = TempDir::new();
-                let source = build.path().join("fake_acp_agent.rs");
-                let binary = build.path().join(if cfg!(windows) {
-                    "fake_acp_agent.exe"
-                } else {
-                    "fake_acp_agent"
-                });
-                std::fs::write(&source, FAKE_ACP_AGENT_SOURCE).expect("write fake ACP source");
-                let status = std::process::Command::new("rustc")
-                    .args(["--edition", "2021", "-o"])
-                    .arg(&binary)
-                    .arg(&source)
-                    .status()
-                    .expect("rustc is required to build the fake ACP agent");
-                assert!(status.success(), "rustc failed to build the fake ACP agent");
-                std::fs::read(&binary).expect("read the compiled fake ACP agent")
-            })
-            .as_slice()
+        static CACHE: OnceLock<CompiledFakeAgentCache> = OnceLock::new();
+        CACHE.get_or_init(CompiledFakeAgentCache::default).acquire()
     }
 
     struct FakeAcpAgent {
@@ -2816,6 +2952,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         events: DriverEventSender,
         event_rx: crossbeam_channel::Receiver<DriverEvent>,
         log_path: std::path::PathBuf,
+        _compiled: Arc<CompiledFakeAgent>,
         _root: TempDir,
     }
 
@@ -2827,16 +2964,9 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
             } else {
                 "fake_acp_agent"
             });
-            std::fs::write(&binary, fake_acp_agent_binary()).expect("write fake ACP agent");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = std::fs::metadata(&binary)
-                    .expect("stat fake ACP agent")
-                    .permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&binary, permissions).expect("chmod fake ACP agent");
-            }
+            let compiled = fake_acp_agent_binary();
+            std::fs::hard_link(&compiled.binary, &binary)
+                .expect("link fake ACP agent into its isolated fixture");
             let cwd = root.path().to_path_buf();
             let log_path = binary.with_file_name("acp.jsonl");
             let (events, event_rx) = crate::driver::test_event_channel();
@@ -2846,6 +2976,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
                 events,
                 event_rx,
                 log_path,
+                _compiled: compiled,
                 _root: root,
             }
         }
@@ -2888,6 +3019,22 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
             panic!("timed out waiting for {method}");
         }
 
+        fn wait_for_method_count(&self, method: &str, count: usize) -> Vec<Value> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let messages = self
+                    .messages()
+                    .into_iter()
+                    .filter(|message| message.get("method").and_then(Value::as_str) == Some(method))
+                    .collect::<Vec<_>>();
+                if messages.len() >= count {
+                    return messages;
+                }
+                std::thread::yield_now();
+            }
+            panic!("timed out waiting for {count} {method} requests");
+        }
+
         /// Stages notifications the agent emits as its durable replay before
         /// answering `session/load`.
         fn stage_load_history(&self, notifications: &[Value]) {
@@ -2913,6 +3060,41 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
             std::fs::write(self._root.path().join("advertise-resume"), b"")
                 .expect("advertise resume capability");
         }
+
+        fn advertise_renoa_config(&self) {
+            std::fs::write(self._root.path().join("advertise-renoa-config"), b"")
+                .expect("advertise Renoa config options");
+        }
+    }
+
+    #[test]
+    fn compiled_fake_agent_cache_releases_its_build_directory() {
+        let cache = CompiledFakeAgentCache::default();
+        let first = cache.acquire();
+        let build_root = first._root.path().to_path_buf();
+        let second = cache.acquire();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        drop(first);
+        assert!(
+            build_root.exists(),
+            "one fixture still owns the compiler output"
+        );
+        drop(second);
+
+        assert!(
+            !build_root.exists(),
+            "the last fixture must remove the compiler output"
+        );
+        assert!(
+            cache
+                .cached
+                .lock()
+                .expect("lock fake ACP agent cache")
+                .upgrade()
+                .is_none(),
+            "the cache must not own compiled fixture state"
+        );
     }
 
     fn fake_acp_start_options(
@@ -3281,7 +3463,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     }
 
     #[test]
-    fn a_hidden_renoa_provider_resolves_its_binary_and_starts() {
+    fn a_selectable_renoa_provider_resolves_its_binary_and_starts() {
         let fixture = FakeAcpAgent::new();
         let probe = crate::model::provider_probe(
             ProviderKind::Renoa,
@@ -3289,7 +3471,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         );
         assert!(probe.installed);
         assert_eq!(probe.path.as_deref(), Some(fixture.binary.as_path()));
-        assert!(!ProviderKind::SELECTABLE.contains(&probe.provider));
+        assert!(ProviderKind::SELECTABLE.contains(&probe.provider));
 
         let driver = crate::driver::start_local(
             ProviderKind::Renoa,
@@ -3300,6 +3482,100 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         assert!(!driver.supports_steer());
         wait_for_renoa_connected(&fixture.event_rx);
         assert_eq!(fixture.methods(), ["initialize", "session/new"]);
+    }
+
+    #[test]
+    fn renoa_applies_model_then_refreshed_reasoning_before_first_prompt() {
+        let fixture = FakeAcpAgent::new();
+        fixture.advertise_renoa_config();
+        let mut options = fake_acp_start_options(&fixture, None);
+        options.model = Some("grok-b".into());
+        options.reasoning_effort = Some("high".into());
+        let driver = AcpDriver::start(ProviderKind::Renoa, options, fixture.events.clone())
+            .expect("the configured Renoa session should start");
+        wait_for_renoa_connected(&fixture.event_rx);
+
+        driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), "hello"));
+        let _ = fixture.wait_for_method("session/prompt");
+        let requests = fixture.messages();
+        let methods = requests
+            .iter()
+            .filter_map(|request| request.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_config_option",
+                "session/prompt"
+            ]
+        );
+        assert_eq!(requests[2]["params"]["configId"], "model");
+        assert_eq!(requests[2]["params"]["value"], "grok-b");
+        assert_eq!(requests[3]["params"]["configId"], "thought_level");
+        assert_eq!(requests[3]["params"]["value"], "high");
+        assert!(!methods.contains(&"session/set_model"));
+    }
+
+    #[test]
+    fn renoa_missing_standard_config_fails_before_prompt() {
+        let fixture = FakeAcpAgent::new();
+        let mut options = fake_acp_start_options(&fixture, None);
+        options.model = Some("grok-b".into());
+        options.reasoning_effort = Some("high".into());
+        let driver = AcpDriver::start(ProviderKind::Renoa, options, fixture.events.clone())
+            .expect("the Renoa transport should start before catalog validation");
+        wait_for_renoa_connected(&fixture.event_rx);
+        driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), "must not run"));
+
+        let error = wait_for_renoa_error(&fixture.event_rx);
+        assert!(error.contains("did not advertise a model option"));
+        let methods = fixture.methods();
+        assert_eq!(methods, ["initialize", "session/new"]);
+        assert!(!methods.contains(&"session/prompt".to_owned()));
+        assert!(!methods.contains(&"session/set_model".to_owned()));
+    }
+
+    #[test]
+    fn renoa_reasoning_only_option_change_does_not_resend_model() {
+        let fixture = FakeAcpAgent::new();
+        fixture.advertise_renoa_config();
+        let mut options = fake_acp_start_options(&fixture, None);
+        options.model = Some("grok-b".into());
+        options.reasoning_effort = Some("low".into());
+        let driver = AcpDriver::start(ProviderKind::Renoa, options, fixture.events.clone())
+            .expect("the configured Renoa session should start");
+        wait_for_renoa_connected(&fixture.event_rx);
+        driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), "first"));
+        let _ = fixture.wait_for_method("session/prompt");
+
+        assert!(driver.apply_options(SessionOptions {
+            mode: RuntimeMode::FullAccess,
+            interaction_mode: InteractionMode::Build,
+            model: Some("grok-b".into()),
+            reasoning_effort: Some("high".into()),
+            service_tier: None,
+            context_window: None,
+        }));
+        driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), "second"));
+        let prompts = fixture.wait_for_method_count("session/prompt", 2);
+        let second_prompt = &prompts[1];
+        assert_eq!(second_prompt["params"]["prompt"][0]["text"], "second");
+
+        let config_requests = fixture
+            .messages()
+            .into_iter()
+            .filter(|request| {
+                request.get("method").and_then(Value::as_str) == Some("session/set_config_option")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(config_requests.len(), 3);
+        assert_eq!(config_requests[0]["params"]["configId"], "model");
+        assert_eq!(config_requests[1]["params"]["configId"], "thought_level");
+        assert_eq!(config_requests[2]["params"]["configId"], "thought_level");
+        assert_eq!(config_requests[2]["params"]["value"], "high");
     }
 
     #[test]
@@ -3317,13 +3593,36 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     #[test]
     fn failed_renoa_session_load_never_sends_session_new() {
         let fixture = FakeAcpAgent::new();
+        fixture.stage_load_history(&[renoa_notification(
+            "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f",
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 12_345,
+                "size": 500_000,
+            }),
+        )]);
         let _driver = start_fake_renoa(
             &fixture,
             Some(ProviderResumeCursor::Renoa {
                 session_id: "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f".into(),
             }),
         );
-        let error = wait_for_renoa_error(&fixture.event_rx);
+        let error = loop {
+            match fixture
+                .event_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Renoa should report the load failure")
+            {
+                DriverEvent::Error(error) => break error,
+                DriverEvent::UsageUpdated { .. } => {
+                    panic!("usage from a failed Renoa load reached the presentation cache")
+                }
+                DriverEvent::ProcessExited => {
+                    panic!("Renoa exited before reporting the load failure")
+                }
+                _ => {}
+            }
+        };
         assert!(
             error.contains("failed to load Renoa session 3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f")
         );
@@ -3440,7 +3739,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         let text_replay = text_capture
             .finalize()
             .expect("text-only tool results work");
-        let ReplayItem::ToolCall(text_tool) = &text_replay.items[1] else {
+        let ReplayItem::ToolCall(text_tool) = &text_replay.replay.items[1] else {
             panic!("text tool is retained");
         };
         assert!(
@@ -3463,7 +3762,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         let image_replay = image_capture
             .finalize()
             .expect("image-only tool results work");
-        let ReplayItem::ToolCall(image_tool) = &image_replay.items[1] else {
+        let ReplayItem::ToolCall(image_tool) = &image_replay.replay.items[1] else {
             panic!("image tool is retained");
         };
         assert_eq!(
@@ -3486,7 +3785,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         let repeated_replay = repeated
             .finalize()
             .expect("repeated images are representable");
-        let ReplayItem::ToolCall(repeated_tool) = &repeated_replay.items[1] else {
+        let ReplayItem::ToolCall(repeated_tool) = &repeated_replay.replay.items[1] else {
             panic!("repeated image tool is retained");
         };
         assert_eq!(
@@ -3511,7 +3810,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         let interleaved_replay = interleaved
             .finalize()
             .expect("interleaved images are representable");
-        let ReplayItem::ToolCall(interleaved_tool) = &interleaved_replay.items[1] else {
+        let ReplayItem::ToolCall(interleaved_tool) = &interleaved_replay.replay.items[1] else {
             panic!("interleaved image tool is retained");
         };
         assert_eq!(
@@ -3576,8 +3875,9 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         }
 
         let replay = capture.finalize().expect("both turns are well formed");
-        assert_eq!(replay.items.len(), 4);
+        assert_eq!(replay.replay.items.len(), 4);
         let outputs = replay
+            .replay
             .items
             .iter()
             .filter_map(|item| match item {
@@ -3628,6 +3928,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 
         let replay = capture.finalize().expect("both tool rounds are valid");
         let tools = replay
+            .replay
             .items
             .iter()
             .filter_map(|item| match item {
@@ -3671,7 +3972,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         )));
 
         let replay = capture.finalize().expect("large output is supported");
-        let ReplayItem::ToolCall(tool) = &replay.items[1] else {
+        let ReplayItem::ToolCall(tool) = &replay.replay.items[1] else {
             panic!("tool result is retained");
         };
         let durable = tool.activity.durable_output().expect("durable output");
@@ -4090,6 +4391,47 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
             1,
             "the acknowledgement must release the queued prompt exactly once"
         );
+    }
+
+    #[test]
+    fn restored_renoa_usage_is_published_only_after_replay_acknowledgement() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        fixture.stage_load_history(&[renoa_notification(
+            durable_session,
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 12_345,
+                "size": 500_000,
+            }),
+        )]);
+        fixture.stage_load_success();
+        let driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+
+        assert!(wait_for_renoa_replay(&fixture).is_empty());
+        wait_for_renoa_connected(&fixture.event_rx);
+        assert!(
+            fixture.event_rx.try_recv().is_err(),
+            "restored usage crossed the durable replay barrier"
+        );
+
+        assert!(driver.acknowledge_replay());
+        match fixture
+            .event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("acknowledged replay should publish restored usage")
+        {
+            DriverEvent::UsageUpdated {
+                context_tokens: Some(12_345),
+                context_window: Some(500_000),
+            } => {}
+            other => panic!("unexpected event after replay acknowledgement: {other:?}"),
+        }
     }
 
     #[test]

@@ -894,8 +894,18 @@ impl Waku {
         };
 
         self.remember_selected_model_traits();
-        let (reasoning_effort, service_tier, context_window) =
+        let default_renoa_reasoning = if provider == ProviderKind::Renoa {
+            self.provider_probe(provider)
+                .and_then(|probe| probe.models.iter().find(|candidate| candidate.id == model))
+                .and_then(|model| model.default_reasoning_effort.clone())
+        } else {
+            None
+        };
+        let (mut reasoning_effort, service_tier, context_window) =
             self.state.model_traits_for(provider, &model);
+        if reasoning_effort.is_none() {
+            reasoning_effort = default_renoa_reasoning;
+        }
         if let Some(session) = self.selected_session_mut() {
             session.provider = provider;
             session.model = Some(model.clone());

@@ -2043,16 +2043,23 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
 }
 
 #[test]
-fn a_hidden_renoa_provider_never_joins_the_picker() {
+fn an_installed_cataloged_renoa_provider_joins_the_picker() {
     use super::ModelPickerTab;
-    use super::composer::{picker_has_no_providers, visible_picker_tabs};
-    use crate::model::{ProviderModel, ProviderProbe};
+    use super::composer::{picker_has_no_providers, visible_picker_models, visible_picker_tabs};
+    use crate::model::{ProviderModel, ProviderModelOption, ProviderProbe};
 
     let probe = |provider: ProviderKind, installed: bool| ProviderProbe {
         provider,
         installed,
         path: installed.then(|| std::path::PathBuf::from(format!("/bin/{}", provider.id()))),
-        models: vec![ProviderModel::new("model", "model")],
+        models: if provider == ProviderKind::Renoa {
+            vec![
+                ProviderModel::new("grok-code", "Grok Code")
+                    .reasoning([ProviderModelOption::new("high", "High")], "high"),
+            ]
+        } else {
+            Vec::new()
+        },
         agent_presets: Vec::new(),
     };
     let probes = [
@@ -2062,11 +2069,29 @@ fn a_hidden_renoa_provider_never_joins_the_picker() {
 
     assert_eq!(
         visible_picker_tabs(&probes, &[], None),
-        vec![ModelPickerTab::Favorites]
+        vec![
+            ModelPickerTab::Favorites,
+            ModelPickerTab::Provider(ProviderKind::Renoa)
+        ]
     );
-    assert!(picker_has_no_providers(&probes, &[], None, true));
-    assert!(!ProviderKind::SELECTABLE.contains(&ProviderKind::Renoa));
-    assert_eq!(ProviderKind::Renoa.for_new_task(), ProviderKind::Codex);
+    assert!(!picker_has_no_providers(&probes, &[], None, true));
+    let models = visible_picker_models(
+        &probes,
+        &[],
+        &[],
+        None,
+        ModelPickerTab::Provider(ProviderKind::Renoa),
+        "",
+    );
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].0, ProviderKind::Renoa);
+    assert_eq!(models[0].1.id, "grok-code");
+    assert_eq!(
+        models[0].1.default_reasoning_effort.as_deref(),
+        Some("high")
+    );
+    assert!(ProviderKind::SELECTABLE.contains(&ProviderKind::Renoa));
+    assert_eq!(ProviderKind::Renoa.for_new_task(), ProviderKind::Renoa);
 }
 
 #[test]
