@@ -594,6 +594,14 @@ async fn run_sdk_connection(
                     })
                     .map_err(|_| replay_transport_error(ReplayTransportError::ConsumerClosed))?;
             }
+            if let Some(commands) = replay
+                .as_ref()
+                .and_then(|loaded| loaded.available_commands.clone())
+            {
+                events
+                    .send(DriverEvent::AvailableCommands(commands))
+                    .map_err(|_| replay_transport_error(ReplayTransportError::ConsumerClosed))?;
+            }
 
             let mut current_model = model;
             let mut current_reasoning_effort = reasoning_effort;
@@ -2061,15 +2069,16 @@ fn fx_context_notice(text: &str) -> bool {
 /// Captures Renoa's durable-history replay while `session/load` is in flight.
 ///
 /// Updates are validated and grouped as they arrive, so the buffer can only
-/// finalize as a complete, well-identified transcript. Context usage is held
-/// beside that transcript until the consumer acknowledges the replay. Known
-/// configuration and status updates carry no transcript semantics and are
-/// ignored; any other unrecognized kind fails the load instead of silently
-/// truncating history.
+/// finalize as a complete, well-identified transcript. Context usage and
+/// available commands are held beside that transcript until the consumer
+/// acknowledges the replay. Known configuration and status updates carry no
+/// transcript semantics and are ignored; any other unrecognized kind fails
+/// the load instead of silently truncating history.
 #[derive(Default)]
 struct RenoaReplayCapture {
     items: Vec<ReplayItem>,
     usage: Option<ReplayedContextUsage>,
+    available_commands: Option<Vec<crate::model::ReportedCommand>>,
     error: Option<String>,
     user_turns: HashMap<uuid::Uuid, uuid::Uuid>,
     turn_messages: HashMap<uuid::Uuid, uuid::Uuid>,
@@ -2102,8 +2111,19 @@ impl RenoaReplayCapture {
                     self.usage = Some(usage);
                 }
             }
+            SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.available_commands = Some(
+                    update
+                        .available_commands
+                        .iter()
+                        .map(|command| crate::model::ReportedCommand {
+                            name: command.name.clone(),
+                            description: command.description.clone(),
+                        })
+                        .collect(),
+                );
+            }
             SessionUpdate::Plan(_)
-            | SessionUpdate::AvailableCommandsUpdate(_)
             | SessionUpdate::CurrentModeUpdate(_)
             | SessionUpdate::ConfigOptionUpdate(_)
             | SessionUpdate::SessionInfoUpdate(_) => {}
@@ -2456,6 +2476,7 @@ impl RenoaReplayCapture {
         Ok(RenoaLoadedReplay {
             replay,
             usage: self.usage,
+            available_commands: self.available_commands,
         })
     }
 }
@@ -2464,6 +2485,7 @@ impl RenoaReplayCapture {
 struct RenoaLoadedReplay {
     replay: ProviderReplay,
     usage: Option<ReplayedContextUsage>,
+    available_commands: Option<Vec<crate::model::ReportedCommand>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4430,6 +4452,53 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
                 context_tokens: Some(12_345),
                 context_window: Some(500_000),
             } => {}
+            other => panic!("unexpected event after replay acknowledgement: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restored_renoa_commands_are_published_only_after_replay_acknowledgement() {
+        let fixture = FakeAcpAgent::new();
+        let durable_session = "3b1c0e7a-2f64-4c91-9d2e-0a1b2c3d4e5f";
+        fixture.stage_load_history(&[renoa_notification(
+            durable_session,
+            json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [{
+                    "name": "compact",
+                    "description": "Summarize durable conversation context now",
+                }],
+            }),
+        )]);
+        fixture.stage_load_success();
+        let driver = start_fake_renoa(
+            &fixture,
+            Some(ProviderResumeCursor::Renoa {
+                session_id: durable_session.into(),
+            }),
+        );
+
+        assert!(wait_for_renoa_replay(&fixture).is_empty());
+        wait_for_renoa_connected(&fixture.event_rx);
+        assert!(
+            fixture.event_rx.try_recv().is_err(),
+            "restored commands crossed the durable replay barrier"
+        );
+
+        assert!(driver.acknowledge_replay());
+        match fixture
+            .event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("acknowledged replay should publish restored commands")
+        {
+            DriverEvent::AvailableCommands(commands) => {
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].name, "compact");
+                assert_eq!(
+                    commands[0].description,
+                    "Summarize durable conversation context now"
+                );
+            }
             other => panic!("unexpected event after replay acknowledgement: {other:?}"),
         }
     }
