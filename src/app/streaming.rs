@@ -186,14 +186,15 @@ impl Waku {
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .is_some_and(|session| {
-                let Some(turn_id) = session.active_turn_id() else {
-                    return false;
-                };
-                session.messages.iter().any(|message| {
-                    message.role == MessageRole::Assistant && message.turn_id == Some(turn_id)
-                })
-            })
+            .is_some_and(|session| active_turn_has_completion_message(session, false))
+    }
+
+    pub(super) fn turn_has_success_message(&self, session_id: Uuid) -> bool {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| active_turn_has_completion_message(session, true))
     }
 
     pub(super) fn accepts_turn_output(&self, session_id: Uuid) -> bool {
@@ -326,6 +327,14 @@ impl Waku {
             DriverEvent::ReasoningDelta(delta) => {
                 if self.accepts_turn_output(session_id) {
                     self.append_reasoning_delta(session_id, runtime, delta);
+                }
+            }
+            DriverEvent::SystemNotice(message) => {
+                if self.accepts_turn_output(session_id)
+                    && !message.trim().is_empty()
+                    && let Some(session) = self.state.session_mut(session_id)
+                {
+                    session.push_message(MessageRole::System, message);
                 }
             }
             DriverEvent::Activity {
@@ -561,7 +570,11 @@ impl Waku {
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);
                 runtime.stream_phase = None;
-                let needs_fallback = !self.turn_has_assistant_message(session_id);
+                let needs_fallback = if success {
+                    !self.turn_has_success_message(session_id)
+                } else {
+                    !self.turn_has_assistant_message(session_id)
+                };
                 if let Some(session) = self.state.session_mut(session_id) {
                     session.status = if success {
                         SessionStatus::Idle
@@ -772,6 +785,20 @@ pub(super) fn push_transcript_activity(
             activities: vec![item],
         });
     }
+}
+
+pub(super) fn active_turn_has_completion_message(
+    session: &AgentSession,
+    include_system: bool,
+) -> bool {
+    let Some(turn_id) = session.active_turn_id() else {
+        return false;
+    };
+    session.messages.iter().any(|message| {
+        message.turn_id == Some(turn_id)
+            && (message.role == MessageRole::Assistant
+                || (include_system && message.role == MessageRole::System))
+    })
 }
 
 pub(super) fn stream_delta_kind(event: &DriverEvent) -> Option<StreamDeltaKind> {

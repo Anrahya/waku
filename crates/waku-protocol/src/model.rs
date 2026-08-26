@@ -1741,6 +1741,9 @@ pub enum DriverEvent {
         context_tokens: Option<u64>,
         context_window: Option<u64>,
     },
+    /// Provider-declared turn status that belongs in the transcript but is
+    /// not an assistant reply, such as confirmation of a control operation.
+    SystemNotice(String),
     /// Account-level rate-limit meters carried by the provider's own stream
     /// (Codex's `account/rateLimits/updated`). Same shape the OAuth fetcher
     /// produces for Claude, so the panel renders both identically.

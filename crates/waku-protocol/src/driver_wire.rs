@@ -118,6 +118,7 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
                 "contextWindow": context_window,
             }),
         ),
+        DriverEvent::SystemNotice(message) => ("systemNotice", Value::String(message)),
         DriverEvent::PlanUsageUpdated(usage) => ("planUsageUpdated", serde_json::to_value(usage)?),
         DriverEvent::TurnFinished { success, summary } => (
             "turnFinished",
@@ -207,6 +208,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 context_window: usage.context_window,
             }
         }
+        "systemNotice" => DriverEvent::SystemNotice(serde_json::from_value(payload)?),
         "planUsageUpdated" => DriverEvent::PlanUsageUpdated(serde_json::from_value(payload)?),
         "turnFinished" => {
             let finished: TurnFinishedWire = serde_json::from_value(payload)?;
@@ -350,5 +352,15 @@ mod tests {
         assert_eq!(request_id, "request-1");
         assert_eq!(questions[0].id, "deployment");
         assert_eq!(questions[0].options[0].label, "Preview");
+    }
+
+    #[test]
+    fn system_notice_round_trips_through_the_driver_wire() {
+        let wire = event_to_wire(DriverEvent::SystemNotice("Context compacted".into())).unwrap();
+        assert_eq!(wire.kind, "systemNotice");
+        assert!(matches!(
+            event_from_wire(wire).unwrap(),
+            DriverEvent::SystemNotice(message) if message == "Context compacted"
+        ));
     }
 }

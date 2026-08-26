@@ -58,6 +58,7 @@ const HANDLED_RUNTIME_EVENT_KINDS = new Set([
   'turnStarted',
   'textDelta',
   'reasoningDelta',
+  'systemNotice',
   'activity',
   'richActivity',
   'permission',
@@ -152,6 +153,25 @@ export function reduceRuntimeEvent(
         appendReasoning(session, payload, clock)
       }
       break
+    case 'systemNotice': {
+      const turn = activeTurn(session)
+      if (
+        turn
+          && typeof payload === 'string'
+          && payload.trim()
+          && acceptsTurnOutput(session)
+      ) {
+        session.messages.push({
+          id: clock.randomUUID(),
+          turn_id: turn.id,
+          role: 'system',
+          content: payload,
+          created_at: clock.nowSeconds(),
+          streaming: false,
+        })
+      }
+      break
+    }
     case 'activity': {
       const value = asRecord(payload)
       if (!acceptsTurnOutput(session) || !value || typeof value.title !== 'string') break
@@ -416,10 +436,13 @@ function settleTurn(
   completeActivities(session)
   const turn = activeTurn(session)
   if (!turn) return false
-  const hasAssistant = session.messages.some(
-    (message) => message.turn_id === turn.id && message.role === 'assistant',
+  const hasCompletionMessage = session.messages.some(
+    (message) =>
+      message.turn_id === turn.id
+        && (message.role === 'assistant'
+          || (status === 'completed' && message.role === 'system')),
   )
-  if (!hasAssistant) {
+  if (!hasCompletionMessage) {
     session.messages.push({
       id: clock.randomUUID(),
       turn_id: turn.id,

@@ -8,11 +8,11 @@ use super::{
     ESCAPE_STOP_CONFIRMATION_TIMEOUT, EscapeStopConfirmation, EscapeStopPress, EscapeStopTarget,
     NAVIGATION_RAIL_TICK_HEIGHT, NAVIGATION_RAIL_TURN_HEIGHT, PendingUserInput, SessionNavigation,
     StreamDeltaKind, TranscriptRowKind::*, active_navigation_turn_index,
-    append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
-    assistant_response_footer_time, can_apply_session_replay, changed_files_inline_message_index,
-    compact_driver_error, disclosure_leading_space, fenced_code, fitted_file_tree_width,
-    fitted_panel_widths, folded_transcript_row_kinds, format_worked_duration,
-    format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
+    active_turn_has_completion_message, append_text_delta_to_session, assistant_response_footer,
+    assistant_response_footer_index, assistant_response_footer_time, can_apply_session_replay,
+    changed_files_inline_message_index, compact_driver_error, disclosure_leading_space,
+    fenced_code, fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
+    format_worked_duration, format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
     message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
     navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
     push_transcript_activity, session_is_reapable, should_refresh_branch_after_activity,
@@ -67,6 +67,17 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
     assert_eq!(answers[1].question_id, "notes");
     assert_eq!(answers[1].answers, ["Use the EU region"]);
 }
+
+#[test]
+fn a_system_notice_completes_a_successful_turn_without_masking_failure() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Renoa);
+    session.begin_turn("/compact");
+    session.push_message(MessageRole::System, "Context compacted");
+
+    assert!(active_turn_has_completion_message(&session, true));
+    assert!(!active_turn_has_completion_message(&session, false));
+}
+
 use gpui::{ListAlignment, ListState, Pixels, px};
 use std::{
     collections::{HashSet, VecDeque},

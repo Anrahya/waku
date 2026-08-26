@@ -52,6 +52,24 @@ describe('reduceRuntimeEvent', () => {
     expect(result.session.messages.at(-1)?.streaming).toBe(false)
   })
 
+  test('shows a system notice without fabricating an assistant reply', () => {
+    let session = apply(runningSession(), 'systemNotice', 'Context compacted')
+    const result = reduceRuntimeEvent(
+      session,
+      event('turnFinished', { success: true, summary: null }),
+      clock,
+    )
+
+    expect(result.settled).toBe(true)
+    expect(result.session.messages).toHaveLength(2)
+    expect(result.session.messages.at(-1)).toMatchObject({
+      role: 'system',
+      content: 'Context compacted',
+      turn_id: 'turn',
+    })
+    expect(result.session.messages.some((message) => message.role === 'assistant')).toBe(false)
+  })
+
   test('sidecar control events still advance the cursor for ordinary providers', () => {
     const result = reduceRuntimeEvent(
       runningSession(),

@@ -1488,7 +1488,7 @@ fn send_prompt(
             let native_failure = wire_offset
                 .filter(|_| !stream_state.lock().produced_content)
                 .and_then(|offset| crate::kimi_session::turn_failure(&native_session_id, offset));
-            let success = finish_prompt(result, native_failure, &callback_events);
+            let success = finish_prompt(provider, result, native_failure, &callback_events);
             if provider == ProviderKind::Grok && success {
                 start_grok_title_refresh(
                     grok_title_home.as_deref(),
@@ -1533,7 +1533,13 @@ fn finish_xai_prompt_complete(
         Some("refusal") => StopReason::Refusal,
         _ => StopReason::EndTurn,
     };
-    finish_prompt(Ok(PromptResponse::new(stop_reason)), None, events).then(|| session_id.to_owned())
+    finish_prompt(
+        ProviderKind::Grok,
+        Ok(PromptResponse::new(stop_reason)),
+        None,
+        events,
+    )
+    .then(|| session_id.to_owned())
 }
 
 fn start_grok_title_refresh(
@@ -1565,6 +1571,7 @@ fn start_grok_title_refresh(
 }
 
 fn finish_prompt(
+    provider: ProviderKind,
     result: agent_client_protocol::Result<PromptResponse>,
     native_failure: Option<String>,
     events: &impl DriverEventSink,
@@ -1591,6 +1598,17 @@ fn finish_prompt(
             summary: None,
         });
         return false;
+    }
+    if provider == ProviderKind::Renoa
+        && response.stop_reason == StopReason::EndTurn
+        && response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("renoa.controlResult"))
+            .and_then(Value::as_str)
+            == Some("compact")
+    {
+        let _ = events.send(DriverEvent::SystemNotice(tr!("session.context_compacted")));
     }
     let (success, summary) = match response.stop_reason {
         StopReason::EndTurn | StopReason::Cancelled => (true, None),
@@ -4974,6 +4992,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         let (events, event_rx) = crossbeam_channel::unbounded();
 
         assert!(!finish_prompt(
+            ProviderKind::Kimi,
             Ok(PromptResponse::new(StopReason::EndTurn)),
             Some("402 membership inactive".to_owned()),
             &events
@@ -4996,6 +5015,7 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     fn typed_prompt_response_settles_the_turn() {
         let (events, event_rx) = crossbeam_channel::unbounded();
         assert!(finish_prompt(
+            ProviderKind::Cursor,
             Ok(PromptResponse::new(StopReason::EndTurn)),
             None,
             &events
@@ -5007,6 +5027,35 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
                 summary: None
             }
         ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn renoa_compaction_result_emits_a_system_notice_before_turn_completion() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let response = PromptResponse::new(StopReason::EndTurn).meta(Map::from_iter([(
+            "renoa.controlResult".to_owned(),
+            Value::String("compact".to_owned()),
+        )]));
+
+        assert!(finish_prompt(
+            ProviderKind::Renoa,
+            Ok(response),
+            None,
+            &events,
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::SystemNotice(message) if message == "Context compacted"
+        ));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            DriverEvent::TurnFinished {
+                success: true,
+                summary: None
+            }
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
