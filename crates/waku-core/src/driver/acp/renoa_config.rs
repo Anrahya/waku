@@ -118,7 +118,11 @@ async fn apply_one(
             .any(|option| option.value.0.as_ref() == value),
         _ => false,
     };
-    if !advertised {
+    // Renoa's provider catalog can refresh while this ACP session stays open.
+    // A model selected from Waku's fresh provider probe may therefore be newer
+    // than these session options. Forward it to Renoa, which refreshes and
+    // validates the authoritative catalog before accepting the change.
+    if !advertised && !matches!(kind, ConfigKind::Model) {
         return Err(ConfigError::ValueNotAdvertised {
             kind,
             value: value.to_owned(),

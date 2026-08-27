@@ -2875,6 +2875,13 @@ fn main() {
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}"
             ),
             "session/set_config_option" => {
+                let current_model = if line.contains("\"configId\":\"model\"")
+                    && line.contains("\"value\":\"grok-new\"")
+                {
+                    "grok-new"
+                } else {
+                    "grok-b"
+                };
                 let current_reasoning = if line.contains("\"configId\":\"thought_level\"")
                     && line.contains("\"value\":\"high\"")
                 {
@@ -2885,10 +2892,11 @@ fn main() {
                 format!(
                     concat!(
                         "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"configOptions\":[",
-                        "{{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-b\",\"options\":[{{\"value\":\"grok-a\",\"name\":\"Grok A\"}},{{\"value\":\"grok-b\",\"name\":\"Grok B\"}}]}},",
+                        "{{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"{current_model}\",\"options\":[{{\"value\":\"grok-a\",\"name\":\"Grok A\"}},{{\"value\":\"grok-b\",\"name\":\"Grok B\"}},{{\"value\":\"grok-new\",\"name\":\"Grok New\"}}]}},",
                         "{{\"id\":\"thought_level\",\"name\":\"Reasoning\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"{current_reasoning}\",\"options\":[{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"high\",\"name\":\"High\"}}]}}]}}}}"
                     ),
                     id = id,
+                    current_model = current_model,
                     current_reasoning = current_reasoning,
                 )
             }
@@ -3616,6 +3624,40 @@ fn json_raw_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
         assert_eq!(config_requests[1]["params"]["configId"], "thought_level");
         assert_eq!(config_requests[2]["params"]["configId"], "thought_level");
         assert_eq!(config_requests[2]["params"]["value"], "high");
+    }
+
+    #[test]
+    fn renoa_forwards_a_model_discovered_after_the_session_started() {
+        let fixture = FakeAcpAgent::new();
+        fixture.advertise_renoa_config();
+        let driver = AcpDriver::start(
+            ProviderKind::Renoa,
+            fake_acp_start_options(&fixture, None),
+            fixture.events.clone(),
+        )
+        .expect("the Renoa session should start with its original catalog");
+        wait_for_renoa_connected(&fixture.event_rx);
+
+        assert!(driver.apply_options(SessionOptions {
+            mode: RuntimeMode::FullAccess,
+            interaction_mode: InteractionMode::Build,
+            model: Some("grok-new".into()),
+            reasoning_effort: None,
+            service_tier: None,
+            context_window: None,
+        }));
+        driver.prompt(TurnPrompt::new(uuid::Uuid::new_v4(), "use the new model"));
+        let _ = fixture.wait_for_method("session/prompt");
+
+        let config = fixture
+            .messages()
+            .into_iter()
+            .find(|request| {
+                request.get("method").and_then(Value::as_str) == Some("session/set_config_option")
+            })
+            .expect("Waku forwards the fresh model through standard ACP config");
+        assert_eq!(config["params"]["configId"], "model");
+        assert_eq!(config["params"]["value"], "grok-new");
     }
 
     #[test]
